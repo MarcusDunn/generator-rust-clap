@@ -11,6 +11,7 @@
 mod config;
 mod emit;
 mod naming;
+mod tags;
 
 use forge_plugin_sdk::convert::generator as conv;
 use forge_plugin_sdk::generator::exports::forge::plugin::generator_api::{
