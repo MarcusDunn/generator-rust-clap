@@ -12,6 +12,34 @@
       "type": "string",
       "minLength": 1,
       "description": "Override the API base URL. Falls back to servers[0].url."
+    },
+    "oauth": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["clientId"],
+      "properties": {
+        "clientId": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Public OAuth client ID; never derivable from the spec."
+        },
+        "schemeId": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Spec security-scheme id to target when multiple oauth2.authorizationCode flows are declared."
+        },
+        "redirectPort": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535,
+          "description": "Loopback port used as the OAuth redirect URI. Defaults to 8848."
+        },
+        "scopes": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Scope override. Defaults to the union of per-op scopes referencing the chosen oauth2 scheme."
+        }
+      }
     }
   }
 }
