@@ -551,22 +551,55 @@ fn render_op_match_arm(
     // Client method arg expressions — in declaration order. Path
     // params matching the placeholder are sourced from `__slug`;
     // everything else from the destructured field of the same name.
+    // When schema-flag relaxation is in effect, fields that were
+    // formerly `String` are emitted as `Option<String>` (clap allows
+    // them empty when --body-schema / --response-schema is set);
+    // unwrap with `.expect(...)` here since clap guarantees `Some` on
+    // the actual-call branch.
+    let relax_active = !relax_unless(op).is_empty();
     let mut call_args: Vec<String> = vec!["__bearer.as_deref()".into()];
     for p in &op.path_params {
         let ident = snake_case(&p.name);
         if exclude.is_some_and(|ph| snake_case(ph) == ident) {
             call_args.push("__slug.clone()".into());
+        } else if relax_active {
+            let kebab = kebab_case(&p.name);
+            call_args.push(format!("{ident}.expect(\"<{kebab}> required\")"));
         } else {
             call_args.push(ident);
         }
     }
-    for p in &op.query_params { call_args.push(snake_case(&p.name)); }
-    for p in &op.header_params { call_args.push(snake_case(&p.name)); }
-    for p in &op.cookie_params { call_args.push(snake_case(&p.name)); }
+    for p in &op.query_params {
+        let ident = snake_case(&p.name);
+        if p.required && relax_active {
+            let kebab = kebab_case(&p.name);
+            call_args.push(format!("{ident}.expect(\"--{kebab} required\")"));
+        } else {
+            call_args.push(ident);
+        }
+    }
+    for p in &op.header_params {
+        let ident = snake_case(&p.name);
+        if p.required && relax_active {
+            let kebab = kebab_case(&p.name);
+            call_args.push(format!("{ident}.expect(\"--{kebab} required\")"));
+        } else {
+            call_args.push(ident);
+        }
+    }
+    for p in &op.cookie_params {
+        let ident = snake_case(&p.name);
+        if p.required && relax_active {
+            let kebab = kebab_case(&p.name);
+            call_args.push(format!("{ident}.expect(\"--{kebab} required\")"));
+        } else {
+            call_args.push(ident);
+        }
+    }
     if let Some(b) = &op.request_body {
         if b.required {
-            // clap's `required_unless_present = "body_schema"` guarantees
-            // `body` is `Some` whenever we reach the API call branch.
+            // clap's `required_unless_present_any` guarantees `body`
+            // is `Some` whenever we reach the API call branch.
             call_args.push("body.expect(\"--body required\")".into());
         } else {
             call_args.push("body".into());
@@ -662,30 +695,52 @@ struct Field {
 fn collect_fields(op: &Operation, exclude_path_param: Option<&str>) -> Vec<Field> {
     let mut out = Vec::new();
     let exclude_snake = exclude_path_param.map(snake_case);
+    let relax = relax_unless(op);
     for p in &op.path_params {
         if exclude_snake.as_deref().is_some_and(|ex| ex == snake_case(&p.name)) {
             continue;
         }
-        out.push(field_for_param(p, FieldKind::Positional));
+        out.push(field_for_param(p, FieldKind::Positional, &relax));
     }
     for p in &op.query_params {
-        out.push(field_for_param(p, FieldKind::Flag));
+        out.push(field_for_param(p, FieldKind::Flag, &relax));
     }
     for p in &op.header_params {
-        out.push(field_for_param(p, FieldKind::Flag));
+        out.push(field_for_param(p, FieldKind::Flag, &relax));
     }
     for p in &op.cookie_params {
-        out.push(field_for_param(p, FieldKind::Flag));
+        out.push(field_for_param(p, FieldKind::Flag, &relax));
     }
-    let has_resp = op_has_response_content(op);
     if let Some(body) = &op.request_body {
-        out.push(field_for_body(body, has_resp));
+        out.push(field_for_body(body, &relax));
         out.push(field_for_body_schema());
     }
-    if has_resp {
+    if op_has_response_content(op) {
         out.push(field_for_response_schema());
     }
     out
+}
+
+/// Schema-flag fields that suppress clap's required-arg gate on this
+/// op's other params. Empty when the op has neither `--body-schema`
+/// nor `--response-schema`.
+fn relax_unless(op: &Operation) -> Vec<&'static str> {
+    let mut v = Vec::new();
+    if op.request_body.is_some() {
+        v.push("body_schema");
+    }
+    if op_has_response_content(op) {
+        v.push("response_schema");
+    }
+    v
+}
+
+fn unless_clause(relax: &[&str]) -> String {
+    relax
+        .iter()
+        .map(|s| format!("\"{s}\""))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[derive(Copy, Clone)]
@@ -694,31 +749,53 @@ enum FieldKind {
     Flag,
 }
 
-fn field_for_param(p: &Parameter, kind: FieldKind) -> Field {
+fn field_for_param(p: &Parameter, kind: FieldKind, relax: &[&str]) -> Field {
     let ident = snake_case(&p.name);
+    let kebab = kebab_case(&p.name);
+    let unless = unless_clause(relax);
+    let relax_active = !relax.is_empty();
+
     let (ty, attrs) = match (kind, p.required) {
-        (FieldKind::Positional, _) => ("String".to_string(), vec![]),
-        (FieldKind::Flag, true) => (
-            "String".to_string(),
-            vec![format!("#[arg(long = \"{}\")]", kebab_case(&p.name))],
-        ),
+        (FieldKind::Positional, _) => {
+            if relax_active {
+                (
+                    "Option<String>".to_string(),
+                    vec![format!("#[arg(required_unless_present_any = [{unless}])]")],
+                )
+            } else {
+                ("String".to_string(), vec![])
+            }
+        }
+        (FieldKind::Flag, true) => {
+            if relax_active {
+                (
+                    "Option<String>".to_string(),
+                    vec![format!(
+                        "#[arg(long = \"{kebab}\", required_unless_present_any = [{unless}])]"
+                    )],
+                )
+            } else {
+                (
+                    "String".to_string(),
+                    vec![format!("#[arg(long = \"{kebab}\")]")],
+                )
+            }
+        }
         (FieldKind::Flag, false) => (
             "Option<String>".to_string(),
-            vec![format!("#[arg(long = \"{}\")]", kebab_case(&p.name))],
+            vec![format!("#[arg(long = \"{kebab}\")]")],
         ),
     };
     let doc = first_line(p.documentation.as_deref());
     Field { ident, ty, doc, attrs }
 }
 
-fn field_for_body(body: &Body, has_response_schema: bool) -> Field {
+fn field_for_body(body: &Body, relax: &[&str]) -> Field {
     let attrs = if body.required {
-        let unless = if has_response_schema {
-            "required_unless_present_any = [\"body_schema\", \"response_schema\"]"
-        } else {
-            "required_unless_present = \"body_schema\""
-        };
-        vec![format!("#[arg(long = \"body\", {unless})]")]
+        let unless = unless_clause(relax);
+        vec![format!(
+            "#[arg(long = \"body\", required_unless_present_any = [{unless}])]"
+        )]
     } else {
         vec!["#[arg(long = \"body\")]".into()]
     };
