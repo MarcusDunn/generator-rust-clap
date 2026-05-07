@@ -9,8 +9,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use forge_plugin_sdk::ir::{
     AdditionalProperties, Body, BodyContent, EnumIntType, EnumStringType, NamedType, ObjectType,
-    PrimitiveKind, PrimitiveType, Response, ResponseStatus, TypeDef, TypeRef, UnionKind,
-    UnionType, Value as IrValue,
+    PrimitiveKind, PrimitiveType, Response, ResponseStatus, TypeDef, TypeRef, UnionKind, UnionType,
+    Value as IrValue,
 };
 use forge_plugin_sdk::serde_json::{self, json, Map, Value};
 use forge_plugin_sdk::values_ext;
@@ -20,11 +20,7 @@ const DIALECT: &str = "https://json-schema.org/draft/2020-12/schema";
 /// JSON Schema for the request body. Picks `application/json` if
 /// present, falls back to the first content entry. Returns `None` if
 /// the body has no content list (shouldn't happen in well-formed IR).
-pub fn render_body_schema(
-    types: &[NamedType],
-    values: &[IrValue],
-    body: &Body,
-) -> Option<String> {
+pub fn render_body_schema(types: &[NamedType], values: &[IrValue], body: &Body) -> Option<String> {
     let content = pick_content(&body.content)?;
     let mut r = Renderer::new(types, values);
     let root = r.render_ref(&content.r#type);
@@ -103,7 +99,10 @@ fn serialize_with_meta(
     obj.insert("$schema".into(), Value::String(DIALECT.into()));
     if let Some(c) = content {
         if !c.media_type.is_empty() {
-            obj.insert("contentMediaType".into(), Value::String(c.media_type.clone()));
+            obj.insert(
+                "contentMediaType".into(),
+                Value::String(c.media_type.clone()),
+            );
         }
     }
     if !defs.is_empty() {
@@ -229,7 +228,8 @@ impl<'a> Renderer<'a> {
                         .or_insert(Value::Bool(true));
                 }
                 if p.read_only {
-                    cm.entry("readOnly".to_string()).or_insert(Value::Bool(true));
+                    cm.entry("readOnly".to_string())
+                        .or_insert(Value::Bool(true));
                 }
                 if p.write_only {
                     cm.entry("writeOnly".to_string())

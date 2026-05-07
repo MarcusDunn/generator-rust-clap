@@ -28,7 +28,10 @@ pub fn all(ir: &Ir, cfg: &Config) -> GenerationOutput {
             "Cargo.toml",
             emit_cargo_toml(&pkg_name, &bin_name, oauth.is_some()),
         ),
-        OutputFile::text("src/main.rs", emit_main_rs(ir, cfg, &bin_name, oauth.as_ref())),
+        OutputFile::text(
+            "src/main.rs",
+            emit_main_rs(ir, cfg, &bin_name, oauth.as_ref()),
+        ),
         OutputFile::text("src/client.rs", emit_client_rs(ir)),
         OutputFile::text("src/runtime.rs", emit_runtime_rs()),
         OutputFile::text("README.md", emit_readme(ir, &bin_name, oauth.as_ref())),
@@ -40,7 +43,10 @@ pub fn all(ir: &Ir, cfg: &Config) -> GenerationOutput {
         ));
     }
 
-    GenerationOutput { files, diagnostics: vec![] }
+    GenerationOutput {
+        files,
+        diagnostics: vec![],
+    }
 }
 
 fn bin_name(ir: &Ir, cfg: &Config) -> String {
@@ -134,7 +140,12 @@ fn detect_oauth<'a>(ir: &'a Ir, cfg: &'a Config) -> Option<OauthInfo<'a>> {
                     set.into_iter().collect()
                 };
                 let exchange = parse_token_exchange(ir, s);
-                return Some(OauthInfo { flow: f, config: oc, scopes, exchange });
+                return Some(OauthInfo {
+                    flow: f,
+                    config: oc,
+                    scopes,
+                    exchange,
+                });
             }
         }
     }
@@ -142,7 +153,10 @@ fn detect_oauth<'a>(ir: &'a Ir, cfg: &'a Config) -> Option<OauthInfo<'a>> {
 }
 
 fn parse_token_exchange(ir: &Ir, scheme: &SecurityScheme) -> Option<TokenExchangeInfo> {
-    let (_, vref) = scheme.extensions.iter().find(|(k, _)| k == "x-token-exchange")?;
+    let (_, vref) = scheme
+        .extensions
+        .iter()
+        .find(|(k, _)| k == "x-token-exchange")?;
     let json = values_ext::resolve_to_serde(&ir.values, *vref);
     let obj = json.as_object()?;
 
@@ -199,7 +213,9 @@ fn extract_placeholders(template: &str) -> Vec<String> {
 }
 
 fn op_uses_placeholder(op: &Operation, placeholder: &str) -> bool {
-    op.path_params.iter().any(|p| snake_case(&p.name) == snake_case(placeholder))
+    op.path_params
+        .iter()
+        .any(|p| snake_case(&p.name) == snake_case(placeholder))
 }
 
 // ---------------------------------------------------------------------------
@@ -313,14 +329,23 @@ fn emit_main_rs(ir: &Ir, cfg: &Config, bin_name: &str, oauth: Option<&OauthInfo>
     if ir.operations.is_empty() && !oauth_active {
         out.push_str("#[derive(Subcommand)]\nenum Cmd {\n    /// (No operations declared in the spec.)\n    #[command(hide = true)]\n    Noop,\n}\n\n");
     } else {
-        emit_root_enum(&mut out, &tree, oauth_active, exchange, placeholder_pascal.as_deref(), placeholder_kebab.as_deref());
+        emit_root_enum(
+            &mut out,
+            &tree,
+            oauth_active,
+            exchange,
+            placeholder_pascal.as_deref(),
+            placeholder_kebab.as_deref(),
+        );
         for root in &tree.roots {
             emit_group_types(&mut out, root, "", exchange);
         }
     }
 
     // main()
-    out.push_str("#[tokio::main(flavor = \"multi_thread\")]\nasync fn main() -> anyhow::Result<()> {\n");
+    out.push_str(
+        "#[tokio::main(flavor = \"multi_thread\")]\nasync fn main() -> anyhow::Result<()> {\n",
+    );
     if oauth_active {
         out.push_str("    // Dynamic shell-completion dispatch. When `COMPLETE` env is set\n    // (e.g. by `eval \"$(COMPLETE=bash <bin>)\"` in shell init), this\n    // prints completions and exits before any normal CLI handling.\n    clap_complete::CompleteEnv::with_factory(Cli::command).complete();\n");
     }
@@ -333,7 +358,9 @@ fn emit_main_rs(ir: &Ir, cfg: &Config, bin_name: &str, oauth: Option<&OauthInfo>
 
     // Profile bootstrap + legacy migration (idempotent, run every invocation).
     if oauth_active {
-        out.push_str("    auth::migrate_legacy()?;\n    auth::bootstrap_default_profile_if_missing()?;\n");
+        out.push_str(
+            "    auth::migrate_legacy()?;\n    auth::bootstrap_default_profile_if_missing()?;\n",
+        );
     }
 
     // Built-in handlers for login / logout / configure / profile / placeholder-config.
@@ -421,7 +448,12 @@ fn emit_root_enum(
     }
 }
 
-fn emit_group_types(out: &mut String, group: &TagGroup, prefix: &str, exchange: Option<&TokenExchangeInfo>) {
+fn emit_group_types(
+    out: &mut String,
+    group: &TagGroup,
+    prefix: &str,
+    exchange: Option<&TokenExchangeInfo>,
+) {
     if group.is_misc() {
         return;
     }
@@ -464,7 +496,9 @@ fn emit_root_match_arms(
     }
     let variant = pascal_case(&root.name);
     let q = qualified_pascal(prefix, &root.name);
-    out.push_str(&format!("        Cmd::{variant}(__g) => match __g.cmd {{\n"));
+    out.push_str(&format!(
+        "        Cmd::{variant}(__g) => match __g.cmd {{\n"
+    ));
     emit_group_match_arms(out, root, &q, "            ", oauth, exchange);
     out.push_str("        },\n");
 }
@@ -481,8 +515,17 @@ fn emit_group_match_arms(
     for child in &group.children {
         let child_variant = pascal_case(&child.name);
         let child_q = qualified_pascal(q, &child.name);
-        out.push_str(&format!("{indent}{cmd_ty}::{child_variant}(__g) => match __g.cmd {{\n"));
-        emit_group_match_arms(out, child, &child_q, &format!("{indent}    "), oauth, exchange);
+        out.push_str(&format!(
+            "{indent}{cmd_ty}::{child_variant}(__g) => match __g.cmd {{\n"
+        ));
+        emit_group_match_arms(
+            out,
+            child,
+            &child_q,
+            &format!("{indent}    "),
+            oauth,
+            exchange,
+        );
         out.push_str(&format!("{indent}}},\n"));
     }
     for op in &group.direct_ops {
@@ -537,7 +580,11 @@ fn render_op_match_arm(
     //     fall back to the main token (`--token` ⇒ stored ⇒ none).
     //   - oauth not active ⇒ raw `--token` flag, possibly None.
     let needs_exchange = exchange.is_some_and(|ex| op_uses_placeholder(op, &ex.placeholder));
-    let exclude = if needs_exchange { exchange.map(|ex| ex.placeholder.as_str()) } else { None };
+    let exclude = if needs_exchange {
+        exchange.map(|ex| ex.placeholder.as_str())
+    } else {
+        None
+    };
 
     // Fields the variant destructures — excludes the path param that
     // duplicates the global `--<placeholder>` flag.
@@ -545,7 +592,14 @@ fn render_op_match_arm(
     let destruct_pat = if destruct_fields.is_empty() {
         String::new()
     } else {
-        format!(" {{ {} }}", destruct_fields.iter().map(|f| f.ident.as_str()).collect::<Vec<_>>().join(", "))
+        format!(
+            " {{ {} }}",
+            destruct_fields
+                .iter()
+                .map(|f| f.ident.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
     };
 
     // Client method arg expressions — in declaration order. Path
@@ -630,7 +684,9 @@ fn render_op_match_arm(
 
     let bearer_block = if needs_exchange {
         let ex = exchange.unwrap();
-        let aud_fmt = ex.audience_template.replace(&format!("{{{}}}", ex.placeholder), "{}");
+        let aud_fmt = ex
+            .audience_template
+            .replace(&format!("{{{}}}", ex.placeholder), "{}");
         let res_let = match &ex.resource_template {
             Some(rt) => {
                 let rt_fmt = rt.replace(&format!("{{{}}}", ex.placeholder), "{}");
@@ -641,7 +697,10 @@ fn render_op_match_arm(
         let scope_let = if ex.extra_scope.is_empty() {
             "None".into()
         } else {
-            format!("Some(\"{}\")", escape_rust_string(&ex.extra_scope.join(" ")))
+            format!(
+                "Some(\"{}\")",
+                escape_rust_string(&ex.extra_scope.join(" "))
+            )
         };
         format!(
             "if let Some(t) = cli.token.clone() {{ Some(t) }} else {{ \
@@ -658,9 +717,8 @@ fn render_op_match_arm(
     };
 
     let const_pascal = screaming_snake(&op.id);
-    let api_path = format!(
-        "{pre_block}let __bearer: Option<String> = {bearer_block};\n{inner_indent}{call}"
-    );
+    let api_path =
+        format!("{pre_block}let __bearer: Option<String> = {bearer_block};\n{inner_indent}{call}");
 
     let mut guards = String::new();
     if has_body {
@@ -697,7 +755,10 @@ fn collect_fields(op: &Operation, exclude_path_param: Option<&str>) -> Vec<Field
     let exclude_snake = exclude_path_param.map(snake_case);
     let relax = relax_unless(op);
     for p in &op.path_params {
-        if exclude_snake.as_deref().is_some_and(|ex| ex == snake_case(&p.name)) {
+        if exclude_snake
+            .as_deref()
+            .is_some_and(|ex| ex == snake_case(&p.name))
+        {
             continue;
         }
         out.push(field_for_param(p, FieldKind::Positional, &relax));
@@ -787,7 +848,12 @@ fn field_for_param(p: &Parameter, kind: FieldKind, relax: &[&str]) -> Field {
         ),
     };
     let doc = first_line(p.documentation.as_deref());
-    Field { ident, ty, doc, attrs }
+    Field {
+        ident,
+        ty,
+        doc,
+        attrs,
+    }
 }
 
 fn field_for_body(body: &Body, relax: &[&str]) -> Field {
@@ -860,7 +926,9 @@ fn build_long_about(
     s.push_str(&format!(
         "  {bin_name} <op> --response-schema   JSON Schemas for response bodies, keyed by status code.\n"
     ));
-    s.push_str("Bodies accept inline JSON, @file.json (read from file), or `-` (read from stdin).\n\n");
+    s.push_str(
+        "Bodies accept inline JSON, @file.json (read from file), or `-` (read from stdin).\n\n",
+    );
 
     if oauth_active {
         s.push_str("Authentication and profiles:\n");
@@ -876,7 +944,9 @@ fn build_long_about(
         s.push_str(
             "  --profile <name>                  Switch between configured profiles (default: \"default\").\n",
         );
-        s.push_str("  --token <jwt>                     Override the stored token for one call.\n\n");
+        s.push_str(
+            "  --token <jwt>                     Override the stored token for one call.\n\n",
+        );
     }
 
     if let Some(ph) = exchange_placeholder_kebab {
@@ -916,8 +986,7 @@ fn emit_schema_consts(ir: &Ir) -> String {
             }
         }
         if op_has_response_content(op) {
-            if let Some(s) = schema::render_response_schemas(&ir.types, &ir.values, &op.responses)
-            {
+            if let Some(s) = schema::render_response_schemas(&ir.types, &ir.values, &op.responses) {
                 out.push_str(&format!(
                     "const RESPONSE_SCHEMA_{pascal}: &str = {};\n",
                     json_string(&s),
@@ -978,21 +1047,37 @@ fn render_client_method(op: &Operation) -> String {
     }
     for p in &op.query_params {
         let ident = snake_case(&p.name);
-        let ty = if p.required { "String" } else { "Option<String>" };
+        let ty = if p.required {
+            "String"
+        } else {
+            "Option<String>"
+        };
         sig_args.push(format!("{ident}: {ty}"));
     }
     for p in &op.header_params {
         let ident = snake_case(&p.name);
-        let ty = if p.required { "String" } else { "Option<String>" };
+        let ty = if p.required {
+            "String"
+        } else {
+            "Option<String>"
+        };
         sig_args.push(format!("{ident}: {ty}"));
     }
     for p in &op.cookie_params {
         let ident = snake_case(&p.name);
-        let ty = if p.required { "String" } else { "Option<String>" };
+        let ty = if p.required {
+            "String"
+        } else {
+            "Option<String>"
+        };
         sig_args.push(format!("{ident}: {ty}"));
     }
     if let Some(body) = &op.request_body {
-        let ty = if body.required { "String" } else { "Option<String>" };
+        let ty = if body.required {
+            "String"
+        } else {
+            "Option<String>"
+        };
         sig_args.push(format!("body: {ty}"));
     }
     let sig = sig_args.join(", ");
@@ -1001,7 +1086,10 @@ fn render_client_method(op: &Operation) -> String {
 
     let (path_fmt, path_args) = render_path_interpolation(path_template, &op.path_params);
     if path_args.is_empty() {
-        body.push_str(&format!("        let __path = String::from(\"{}\");\n", escape_rust_string(&path_fmt)));
+        body.push_str(&format!(
+            "        let __path = String::from(\"{}\");\n",
+            escape_rust_string(&path_fmt)
+        ));
     } else {
         body.push_str(&format!(
             "        let __path = format!(\"{}\", {});\n",
@@ -1030,9 +1118,7 @@ fn render_client_method(op: &Operation) -> String {
         let ident = snake_case(&p.name);
         let raw = &p.name;
         if p.required {
-            body.push_str(&format!(
-                "        __r = __r.header(\"{raw}\", &{ident});\n"
-            ));
+            body.push_str(&format!("        __r = __r.header(\"{raw}\", &{ident});\n"));
         } else {
             body.push_str(&format!(
                 "        if let Some(v) = &{ident} {{ __r = __r.header(\"{raw}\", v); }}\n"
@@ -1058,7 +1144,9 @@ fn render_client_method(op: &Operation) -> String {
     }
     if let Some(b) = &op.request_body {
         if b.required {
-            body.push_str("        let __body_value = parse_body_arg(&body).context(\"--body\")?;\n");
+            body.push_str(
+                "        let __body_value = parse_body_arg(&body).context(\"--body\")?;\n",
+            );
             body.push_str("        __r = __r.json(&__body_value);\n");
         } else {
             body.push_str("        if let Some(s) = &body {\n            let v = parse_body_arg(s).context(\"--body\")?;\n            __r = __r.json(&v);\n        }\n");
@@ -1076,7 +1164,9 @@ fn render_client_method(op: &Operation) -> String {
     if let Some(doc) = first_line(op.documentation.as_deref()) {
         s.push_str(&format!("    /// {}\n", escape_doc(&doc)));
     }
-    s.push_str(&format!("    pub async fn {method_ident}(&self, {sig}) -> Result<Value> {{\n"));
+    s.push_str(&format!(
+        "    pub async fn {method_ident}(&self, {sig}) -> Result<Value> {{\n"
+    ));
     s.push_str(&body);
     s.push_str("    }\n\n");
     s
@@ -1202,10 +1292,16 @@ fn emit_auth_rs(bin_name: &str, oa: &OauthInfo, base_url_default: &str) -> Strin
         .replace("__CLIENT_ID__", &escape_rust_string(client_id))
         .replace("__AUTH_URL__", &escape_rust_string(auth_url))
         .replace("__TOKEN_URL__", &escape_rust_string(token_url))
-        .replace("__BASE_URL_DEFAULT__", &escape_rust_string(base_url_default))
+        .replace(
+            "__BASE_URL_DEFAULT__",
+            &escape_rust_string(base_url_default),
+        )
         .replace("__REDIRECT_PORT__", &port.to_string())
         .replace("__SCOPES__", &scopes_lit)
-        .replace("__CLIENT_SECRET_ENV__", &escape_rust_string(client_secret_env))
+        .replace(
+            "__CLIENT_SECRET_ENV__",
+            &escape_rust_string(client_secret_env),
+        )
         .replace("__PREFIX__", &env_prefix(bin_name))
 }
 
@@ -1932,7 +2028,12 @@ fn emit_readme(ir: &Ir, bin_name: &str, oauth: Option<&OauthInfo>) -> String {
         let mut s = format!(
             "\n## OAuth\n\nThis CLI was generated with OAuth 2.0 (PKCE authorization-code) wired up.\n\n```sh\n{bin_name} login    # opens a browser, persists the access token\n{bin_name} logout   # deletes the stored token\n```\n\nThe token is stored at the platform config dir under `{bin_name}/profiles/<profile>/auth.json` (mode 0600 on Unix).\nThe token is refreshed lazily on a 30-second skew.\n\n## Profiles (AWS-style)\n\nThe CLI bundles deployment-specific settings (URLs, client ID/secret) under named profiles in `<config_dir>/{bin_name}/config.toml`. The `default` profile is auto-populated from the spec on first run.\n\n```sh\n{bin_name} --profile dev <op>          # one-off override\n{prefix}_PROFILE=dev {bin_name} <op>    # via env\n```\n\nProfile fields are: `base_url`, `auth_url`, `token_url`, `client_id`, `client_secret`. Hand-edit `config.toml` for now (`{bin_name} configure` lands in a follow-up). Resolution chain per setting: `--<flag>` → `{prefix}_<NAME>` env → profile field → spec default.\n\nClient-secret resolution: per-profile literal `client_secret = \"...\"` → `{prefix}_CLIENT_SECRET` env (or the env var named in the generator's `oauth.clientSecretEnv`) → none. Storing the secret literally in `config.toml` matches the security posture of `~/.aws/credentials` (mode 0600 on Unix).\n\n### Targeting a different IdP host\n\n```sh\nexport {prefix}_AUTH_URL=https://auth.dev.example.com/realms/<realm>/protocol/openid-connect/auth\nexport {prefix}_TOKEN_URL=https://auth.dev.example.com/realms/<realm>/protocol/openid-connect/token\n```\n\nOr, more durably, edit the relevant profile in `config.toml`.\n"
         );
-        if let Some(env) = oa.config.client_secret_env.as_deref().filter(|s| !s.is_empty()) {
+        if let Some(env) = oa
+            .config
+            .client_secret_env
+            .as_deref()
+            .filter(|s| !s.is_empty())
+        {
             s.push_str(&format!(
                 "\nThe configured OAuth client is **confidential** — set `{env}` to the client secret in your shell before running `{bin_name} login` (or any tenant-scoped operation).\n"
             ));
@@ -1966,7 +2067,9 @@ fn emit_readme(ir: &Ir, bin_name: &str, oauth: Option<&OauthInfo>) -> String {
 }
 
 fn first_line(s: Option<&str>) -> Option<String> {
-    s.and_then(|s| s.lines().next()).map(|l| l.trim().to_string()).filter(|s| !s.is_empty())
+    s.and_then(|s| s.lines().next())
+        .map(|l| l.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 fn escape_rust_string(s: &str) -> String {
@@ -1978,7 +2081,10 @@ fn escape_doc(s: &str) -> String {
 }
 
 fn json_string(s: &str) -> String {
-    let escaped = s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n");
+    let escaped = s
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n");
     format!("\"{escaped}\"")
 }
 
@@ -1988,8 +2094,14 @@ mod tests {
 
     #[test]
     fn extract_placeholders_simple() {
-        assert_eq!(extract_placeholders("urn:x:tenant:{tenant}"), vec!["tenant"]);
-        assert_eq!(extract_placeholders("https://api/{a}/{b}/items"), vec!["a", "b"]);
+        assert_eq!(
+            extract_placeholders("urn:x:tenant:{tenant}"),
+            vec!["tenant"]
+        );
+        assert_eq!(
+            extract_placeholders("https://api/{a}/{b}/items"),
+            vec!["a", "b"]
+        );
         assert_eq!(extract_placeholders("static"), Vec::<String>::new());
     }
 
@@ -2011,7 +2123,9 @@ mod tests {
         // Empty tag tree is enough to drive emit_root_enum into the oauth branch.
         let tree = TagTree { roots: vec![] };
         let mut out = String::new();
-        emit_root_enum(&mut out, &tree, /*oauth_active*/ true, None, None, None);
+        emit_root_enum(
+            &mut out, &tree, /*oauth_active*/ true, None, None, None,
+        );
 
         // Struct-form Configure with each scriptable field + the bypass flag.
         for needle in [
@@ -2023,7 +2137,10 @@ mod tests {
             "client_secret: Option<String>",
             "non_interactive: bool",
         ] {
-            assert!(out.contains(needle), "emitted Cmd enum missing `{needle}`:\n{out}");
+            assert!(
+                out.contains(needle),
+                "emitted Cmd enum missing `{needle}`:\n{out}"
+            );
         }
     }
 }

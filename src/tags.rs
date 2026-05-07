@@ -49,7 +49,10 @@ pub fn build<'a>(ir: &'a Ir) -> TagTree<'a> {
     for tag in &ir.tags {
         if let Some(parent) = tag.parent.as_deref() {
             if declared.contains_key(parent) {
-                children_of.entry(parent).or_default().push(tag.name.as_str());
+                children_of
+                    .entry(parent)
+                    .or_default()
+                    .push(tag.name.as_str());
                 continue;
             }
         }
@@ -115,5 +118,10 @@ fn build_group<'a>(
         .flatten()
         .map(|child| build_group(child, declared, children_of, by_tag))
         .collect();
-    TagGroup { name: name.to_string(), tag, direct_ops, children }
+    TagGroup {
+        name: name.to_string(),
+        tag,
+        direct_ops,
+        children,
+    }
 }
