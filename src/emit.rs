@@ -275,9 +275,9 @@ fn emit_main_rs(ir: &Ir, cfg: &Config, bin_name: &str, oauth: Option<&OauthInfo>
     if ir.operations.is_empty() && !oauth_active {
         out.push_str("#[derive(Subcommand)]\nenum Cmd {\n    /// (No operations declared in the spec.)\n    #[command(hide = true)]\n    Noop,\n}\n\n");
     } else {
-        emit_root_enum(&mut out, &tree, oauth_active, exchange.is_some(), placeholder_pascal.as_deref(), placeholder_kebab.as_deref());
+        emit_root_enum(&mut out, &tree, oauth_active, exchange, placeholder_pascal.as_deref(), placeholder_kebab.as_deref());
         for root in &tree.roots {
-            emit_group_types(&mut out, root, "");
+            emit_group_types(&mut out, root, "", exchange);
         }
     }
 
@@ -330,7 +330,7 @@ fn emit_root_enum(
     out: &mut String,
     tree: &TagTree,
     oauth_active: bool,
-    exchange_active: bool,
+    exchange: Option<&TokenExchangeInfo>,
     placeholder_pascal: Option<&str>,
     placeholder_kebab: Option<&str>,
 ) {
@@ -338,7 +338,7 @@ fn emit_root_enum(
     if oauth_active {
         out.push_str("    /// Run OAuth 2.0 authorization-code flow with PKCE; persists the access token.\n    Login,\n    /// Delete the stored OAuth token.\n    Logout,\n");
     }
-    if exchange_active {
+    if exchange.is_some() {
         let pascal = placeholder_pascal.unwrap();
         let kebab = placeholder_kebab.unwrap();
         out.push_str(&format!(
@@ -348,7 +348,7 @@ fn emit_root_enum(
     for root in &tree.roots {
         if root.is_misc() {
             for op in &root.direct_ops {
-                out.push_str(&render_op_variant(op, "    "));
+                out.push_str(&render_op_variant(op, "    ", exchange));
             }
         } else {
             let variant = pascal_case(&root.name);
@@ -360,7 +360,7 @@ fn emit_root_enum(
     out.push_str("}\n\n");
 }
 
-fn emit_group_types(out: &mut String, group: &TagGroup, prefix: &str) {
+fn emit_group_types(out: &mut String, group: &TagGroup, prefix: &str, exchange: Option<&TokenExchangeInfo>) {
     if group.is_misc() {
         return;
     }
@@ -379,12 +379,12 @@ fn emit_group_types(out: &mut String, group: &TagGroup, prefix: &str) {
         out.push_str(&format!("    {variant}({child_q}Args),\n"));
     }
     for op in &group.direct_ops {
-        out.push_str(&render_op_variant(op, "    "));
+        out.push_str(&render_op_variant(op, "    ", exchange));
     }
     out.push_str("}\n\n");
 
     for child in &group.children {
-        emit_group_types(out, child, &q);
+        emit_group_types(out, child, &q, exchange);
     }
 }
 
@@ -429,7 +429,7 @@ fn emit_group_match_arms(
     }
 }
 
-fn render_op_variant(op: &Operation, indent: &str) -> String {
+fn render_op_variant(op: &Operation, indent: &str, exchange: Option<&TokenExchangeInfo>) -> String {
     let variant = pascal_case(&op.id);
     let summary = first_line(op.documentation.as_deref()).unwrap_or_default();
     let mut s = String::new();
@@ -437,7 +437,10 @@ fn render_op_variant(op: &Operation, indent: &str) -> String {
         s.push_str(&format!("{indent}/// {}\n", escape_doc(&summary)));
     }
 
-    let fields = collect_fields(op);
+    let exclude = exchange
+        .filter(|ex| op_uses_placeholder(op, &ex.placeholder))
+        .map(|ex| ex.placeholder.as_str());
+    let fields = collect_fields(op, exclude);
     if fields.is_empty() {
         s.push_str(&format!("{indent}{variant},\n"));
     } else {
@@ -474,11 +477,49 @@ fn render_op_match_arm(
     //     fall back to the main token (`--token` ⇒ stored ⇒ none).
     //   - oauth not active ⇒ raw `--token` flag, possibly None.
     let needs_exchange = exchange.is_some_and(|ex| op_uses_placeholder(op, &ex.placeholder));
+    let exclude = if needs_exchange { exchange.map(|ex| ex.placeholder.as_str()) } else { None };
 
-    let bearer_block = if needs_exchange {
+    // Fields the variant destructures — excludes the path param that
+    // duplicates the global `--<placeholder>` flag.
+    let destruct_fields = collect_fields(op, exclude);
+    let destruct_pat = if destruct_fields.is_empty() {
+        String::new()
+    } else {
+        format!(" {{ {} }}", destruct_fields.iter().map(|f| f.ident.as_str()).collect::<Vec<_>>().join(", "))
+    };
+
+    // Client method arg expressions — in declaration order. Path
+    // params matching the placeholder are sourced from `__slug`;
+    // everything else from the destructured field of the same name.
+    let mut call_args: Vec<String> = vec!["__bearer.as_deref()".into()];
+    for p in &op.path_params {
+        let ident = snake_case(&p.name);
+        if exclude.is_some_and(|ph| snake_case(ph) == ident) {
+            call_args.push("__slug.clone()".into());
+        } else {
+            call_args.push(ident);
+        }
+    }
+    for p in &op.query_params { call_args.push(snake_case(&p.name)); }
+    for p in &op.header_params { call_args.push(snake_case(&p.name)); }
+    for p in &op.cookie_params { call_args.push(snake_case(&p.name)); }
+    if op.request_body.is_some() { call_args.push("body".into()); }
+    let call = format!("client.{method_ident}({}).await?", call_args.join(", "));
+
+    let pre_block = if needs_exchange {
         let ex = exchange.unwrap();
         let ph_snake = snake_case(&ex.placeholder);
         let ph_kebab = kebab_case(&ex.placeholder);
+        format!(
+            "let __slug: String = __resolved_{ph_snake}.clone().ok_or_else(|| \
+                anyhow::anyhow!(\"--{ph_kebab} is required for this operation (or run `set-{ph_kebab} <slug>`)\"))?;\n{indent}    "
+        )
+    } else {
+        String::new()
+    };
+
+    let bearer_block = if needs_exchange {
+        let ex = exchange.unwrap();
         let aud_fmt = ex.audience_template.replace(&format!("{{{}}}", ex.placeholder), "{}");
         let res_let = match &ex.resource_template {
             Some(rt) => {
@@ -494,8 +535,6 @@ fn render_op_match_arm(
         };
         format!(
             "if let Some(t) = cli.token.clone() {{ Some(t) }} else {{ \
-                let __slug = __resolved_{ph_snake}.clone().ok_or_else(|| \
-                    anyhow::anyhow!(\"--{ph_kebab} is required for this operation (or run `set-{ph_kebab} <slug>`)\"))?; \
                 let __aud = format!(\"{aud_fmt}\", __slug); \
                 let __res: Option<String> = {res_let}; \
                 let __scope: Option<&str> = {scope_let}; \
@@ -508,18 +547,9 @@ fn render_op_match_arm(
         "cli.token.clone()".into()
     };
 
-    if fields.is_empty() {
-        format!(
-            "{indent}{cmd_ty}::{variant} => {{\n{indent}    let __bearer: Option<String> = {bearer_block};\n{indent}    client.{method_ident}(__bearer.as_deref()).await?\n{indent}}},\n",
-        )
-    } else {
-        let names: Vec<&str> = fields.iter().map(|f| f.ident.as_str()).collect();
-        format!(
-            "{indent}{cmd_ty}::{variant} {{ {pat} }} => {{\n{indent}    let __bearer: Option<String> = {bearer_block};\n{indent}    client.{method_ident}(__bearer.as_deref(), {args}).await?\n{indent}}},\n",
-            pat = names.join(", "),
-            args = names.join(", "),
-        )
-    }
+    format!(
+        "{indent}{cmd_ty}::{variant}{destruct_pat} => {{\n{indent}    {pre_block}let __bearer: Option<String> = {bearer_block};\n{indent}    {call}\n{indent}}},\n",
+    )
 }
 
 struct Field {
@@ -529,9 +559,13 @@ struct Field {
     attrs: Vec<String>,
 }
 
-fn collect_fields(op: &Operation) -> Vec<Field> {
+fn collect_fields(op: &Operation, exclude_path_param: Option<&str>) -> Vec<Field> {
     let mut out = Vec::new();
+    let exclude_snake = exclude_path_param.map(snake_case);
     for p in &op.path_params {
+        if exclude_snake.as_deref().is_some_and(|ex| ex == snake_case(&p.name)) {
+            continue;
+        }
         out.push(field_for_param(p, FieldKind::Positional));
     }
     for p in &op.query_params {
