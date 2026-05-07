@@ -1,0 +1,18 @@
+[package]
+name = "generator-rust-clap"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.83"
+license = "Apache-2.0 OR MIT"
+description = "OpenAPI Forge generator that emits a Rust CLI crate using clap derive."
+repository = "https://github.com/MarcusDunn/generator-rust-clap"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+forge-plugin-sdk = { version = "0.1.8", features = ["generator"] }
+serde = { version = "1.0", features = ["derive"] }
+
+[lints.rust]
+unsafe_code = "deny"

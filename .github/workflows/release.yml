@@ -1,0 +1,87 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version tag to publish (e.g. 0.0.1). Used as the OCI tag."
+        required: true
+        default: "0.0.1"
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write       # oras push to ghcr.io via GITHUB_TOKEN
+    env:
+      PLUGIN: generator-rust-clap
+      WASM_FILE: generator_rust_clap.wasm
+      MEDIA_TYPE: application/vnd.bytecodealliance.wasm.component.layer.v0+wasm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        run: |
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="${{ inputs.version }}"
+          fi
+          echo "version=$VERSION" >>"$GITHUB_OUTPUT"
+
+      # OCI repository names must be lowercase. ${{ github.repository_owner }}
+      # preserves case (e.g. "MarcusDunn"), which oras rejects.
+      - name: Compute lowercase IMAGE
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: echo "IMAGE=ghcr.io/${OWNER,,}/${PLUGIN}" >>"$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build plugin
+        run: cargo build --release --target wasm32-wasip2
+
+      - uses: oras-project/setup-oras@v1
+
+      - name: Login to GHCR
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GITHUB_TOKEN" \
+            | oras login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Push versioned tag
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          WASM=target/wasm32-wasip2/release/${WASM_FILE}
+          oras push "$IMAGE:$VERSION" \
+            --artifact-type application/vnd.bytecodealliance.wasm.component.v0 \
+            --annotation "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
+            --annotation "org.opencontainers.image.version=$VERSION" \
+            --annotation "org.opencontainers.image.revision=${{ github.sha }}" \
+            --annotation "org.opencontainers.image.licenses=Apache-2.0 OR MIT" \
+            --annotation "org.opencontainers.image.description=OpenAPI Forge generator that emits a Rust CLI crate (clap derive + reqwest)." \
+            "$WASM:$MEDIA_TYPE"
+          {
+            echo "## ${PLUGIN} OCI artifact"
+            echo "- \`$IMAGE:$VERSION\`"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Tag :latest
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: oras tag "$IMAGE:$VERSION" latest
