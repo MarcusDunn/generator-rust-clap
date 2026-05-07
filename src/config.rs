@@ -22,8 +22,10 @@ pub struct Config {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct OAuthConfig {
-    /// OAuth client ID for the public CLI client. Never derivable
-    /// from the spec.
+    /// OAuth client ID. Public clients leave `clientSecretEnv` unset;
+    /// confidential clients (e.g. when the chosen IdP requires client
+    /// authentication for token exchange — see Keycloak 26 standard
+    /// token exchange) set both this and `clientSecretEnv`.
     pub client_id: String,
     /// Spec security-scheme id to target when more than one
     /// `oauth2.authorizationCode` flow is declared. Optional.
@@ -33,4 +35,10 @@ pub struct OAuthConfig {
     /// Per-installation scope override. Defaults to the union of
     /// per-op scopes referencing the chosen scheme.
     pub scopes: Option<Vec<String>>,
+    /// Name of the env var the generated CLI reads at runtime to
+    /// obtain a client secret. When set, every token-endpoint call
+    /// (login, refresh, RFC 8693 exchange) attaches
+    /// `Authorization: Basic base64(<client_id>:<secret>)`.
+    /// Unset → public client, no client auth on token endpoint.
+    pub client_secret_env: Option<String>,
 }

@@ -1,15 +1,16 @@
-//! Generation entry point. Phases 0–2 combined: emits a buildable
-//! Rust CLI crate (clap derive + reqwest) with tag-grouped subcommands
-//! and, when the spec + plugin config jointly opt in, an OAuth 2.0 PKCE
-//! `login`/`logout` pair backed by a tokio loopback listener.
+//! Generation entry point. Emits a buildable Rust CLI crate (clap
+//! derive + reqwest) with tag-grouped subcommands and, when the spec
+//! + plugin config opt in, OAuth 2.0 PKCE login/logout plus optional
+//! RFC 8693 token exchange driven by a generic `x-token-exchange`
+//! extension on the chosen oauth2 security scheme.
 
 use std::collections::BTreeSet;
 
 use forge_plugin_sdk::ir::{
     Body, HttpMethod, Ir, OAuth2Flow, OAuth2FlowKind, Operation, Parameter, SecurityScheme,
-    SecuritySchemeKind,
+    SecuritySchemeKind, ValueRef,
 };
-use forge_plugin_sdk::{GenerationOutput, OutputFile};
+use forge_plugin_sdk::{values_ext, GenerationOutput, OutputFile};
 
 use crate::config::{Config, OAuthConfig};
 use crate::naming::{kebab_case, pascal_case, screaming_snake, snake_case};
@@ -28,7 +29,7 @@ pub fn all(ir: &Ir, cfg: &Config) -> GenerationOutput {
         OutputFile::text("src/main.rs", emit_main_rs(ir, cfg, &bin_name, oauth.as_ref())),
         OutputFile::text("src/client.rs", emit_client_rs(ir)),
         OutputFile::text("src/runtime.rs", emit_runtime_rs()),
-        OutputFile::text("README.md", emit_readme(ir, &bin_name, oauth.is_some())),
+        OutputFile::text("README.md", emit_readme(ir, &bin_name, oauth.as_ref())),
     ];
     if let Some(oa) = &oauth {
         files.push(OutputFile::text("src/auth.rs", emit_auth_rs(&bin_name, oa)));
@@ -64,13 +65,28 @@ fn env_prefix(bin_name: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// OAuth activation
+// OAuth activation + token-exchange detection
 // ---------------------------------------------------------------------------
 
 struct OauthInfo<'a> {
     flow: &'a OAuth2Flow,
     config: &'a OAuthConfig,
     scopes: Vec<String>,
+    exchange: Option<TokenExchangeInfo>,
+}
+
+#[derive(Debug, Clone)]
+struct TokenExchangeInfo {
+    /// Audience template like `"urn:vendor:tenant:{tenant}"`.
+    audience_template: String,
+    /// Single placeholder name extracted from the template. v0.0.6
+    /// supports exactly one placeholder; multi-placeholder is a
+    /// followup.
+    placeholder: String,
+    /// Optional RFC 8707 `resource` template.
+    resource_template: Option<String>,
+    /// Optional extra scopes to request on the exchange.
+    extra_scope: Vec<String>,
 }
 
 fn detect_oauth<'a>(ir: &'a Ir, cfg: &'a Config) -> Option<OauthInfo<'a>> {
@@ -112,11 +128,73 @@ fn detect_oauth<'a>(ir: &'a Ir, cfg: &'a Config) -> Option<OauthInfo<'a>> {
                     }
                     set.into_iter().collect()
                 };
-                return Some(OauthInfo { flow: f, config: oc, scopes });
+                let exchange = parse_token_exchange(ir, s);
+                return Some(OauthInfo { flow: f, config: oc, scopes, exchange });
             }
         }
     }
     None
+}
+
+fn parse_token_exchange(ir: &Ir, scheme: &SecurityScheme) -> Option<TokenExchangeInfo> {
+    let (_, vref) = scheme.extensions.iter().find(|(k, _)| k == "x-token-exchange")?;
+    let json = values_ext::resolve_to_serde(&ir.values, *vref);
+    let obj = json.as_object()?;
+
+    let audience_template = obj.get("audience-template")?.as_str()?.to_string();
+    let placeholders = extract_placeholders(&audience_template);
+    if placeholders.len() != 1 {
+        // v0.0.6 supports exactly one placeholder. Multi-placeholder is a
+        // followup. Falling back to non-exchange mode.
+        return None;
+    }
+    let placeholder = placeholders.into_iter().next().unwrap();
+
+    let resource_template = obj
+        .get("resource-template")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let extra_scope: Vec<String> = obj
+        .get("scope")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Some(TokenExchangeInfo {
+        audience_template,
+        placeholder,
+        resource_template,
+        extra_scope,
+    })
+}
+
+fn extract_placeholders(template: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut chars = template.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '{' {
+            let mut name = String::new();
+            for c2 in chars.by_ref() {
+                if c2 == '}' {
+                    break;
+                }
+                name.push(c2);
+            }
+            if !name.is_empty() && !out.contains(&name) {
+                out.push(name);
+            }
+        }
+    }
+    out
+}
+
+fn op_uses_placeholder(op: &Operation, placeholder: &str) -> bool {
+    op.path_params.iter().any(|p| snake_case(&p.name) == snake_case(placeholder))
 }
 
 // ---------------------------------------------------------------------------
@@ -147,7 +225,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap = {{ version = "4", features = ["derive", "env"] }}
-tokio = {{ version = "1", features = ["macros", "rt-multi-thread", "net", "io-util"] }}
+tokio = {{ version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "sync"] }}
 serde = {{ version = "1", features = ["derive"] }}
 serde_json = "1"
 anyhow = "1"
@@ -169,42 +247,78 @@ fn emit_main_rs(ir: &Ir, cfg: &Config, bin_name: &str, oauth: Option<&OauthInfo>
 
     let tree = tags::build(ir);
     let oauth_active = oauth.is_some();
+    let exchange = oauth.and_then(|o| o.exchange.as_ref());
+    let placeholder_kebab = exchange.map(|e| kebab_case(&e.placeholder));
+    let placeholder_snake = exchange.map(|e| snake_case(&e.placeholder));
+    let placeholder_pascal = exchange.map(|e| pascal_case(&e.placeholder));
 
     let mut out = String::new();
-    out.push_str("// Generated by openapi-forge / generator-rust-clap; do not edit by hand.\n#![allow(clippy::needless_late_init, clippy::redundant_field_names, clippy::too_many_arguments)]\n\n");
+    out.push_str("// Generated by openapi-forge / generator-rust-clap; do not edit by hand.\n#![allow(clippy::needless_late_init, clippy::redundant_field_names, clippy::too_many_arguments, clippy::collapsible_if)]\n\n");
     if oauth_active {
         out.push_str("mod auth;\n");
     }
     out.push_str("mod client;\nmod runtime;\n\nuse clap::{Args, Parser, Subcommand};\nuse client::ApiClient;\nuse runtime::OutputMode;\n\n");
 
     out.push_str(&format!(
-        "#[derive(Parser)]\n#[command(name = \"{bin_name}\", version = \"{version}\", about = \"{title}\", long_about = None)]\nstruct Cli {{\n    /// API base URL.\n    #[arg(long, global = true, env = \"{prefix}_BASE_URL\", default_value = \"{base_url}\")]\n    base_url: String,\n\n    /// Bearer token. Overrides any stored OAuth token.\n    #[arg(long, global = true, env = \"{prefix}_TOKEN\")]\n    token: Option<String>,\n\n    /// Output mode for response bodies.\n    #[arg(long, global = true, value_enum, default_value_t = OutputMode::Json)]\n    output: OutputMode,\n\n    #[command(subcommand)]\n    cmd: Cmd,\n}}\n\n"
+        "#[derive(Parser)]\n#[command(name = \"{bin_name}\", version = \"{version}\", about = \"{title}\", long_about = None)]\nstruct Cli {{\n    /// API base URL.\n    #[arg(long, global = true, env = \"{prefix}_BASE_URL\", default_value = \"{base_url}\")]\n    base_url: String,\n\n    /// Bearer token. Overrides any stored OAuth or exchanged token.\n    #[arg(long, global = true, env = \"{prefix}_TOKEN\")]\n    token: Option<String>,\n\n    /// Output mode for response bodies.\n    #[arg(long, global = true, value_enum, default_value_t = OutputMode::Json)]\n    output: OutputMode,\n\n"
     ));
+
+    if let (Some(kebab), Some(snake)) = (&placeholder_kebab, &placeholder_snake) {
+        let env_name = format!("{}_{}", prefix, screaming_snake(snake));
+        out.push_str(&format!(
+            "    /// Slug used to template the RFC 8693 exchange audience for tenant-scoped operations.\n    #[arg(long = \"{kebab}\", global = true, env = \"{env_name}\")]\n    {snake}: Option<String>,\n\n"
+        ));
+    }
+
+    out.push_str("    #[command(subcommand)]\n    cmd: Cmd,\n}\n\n");
 
     if ir.operations.is_empty() && !oauth_active {
         out.push_str("#[derive(Subcommand)]\nenum Cmd {\n    /// (No operations declared in the spec.)\n    #[command(hide = true)]\n    Noop,\n}\n\n");
     } else {
-        emit_root_enum(&mut out, &tree, oauth_active);
+        emit_root_enum(&mut out, &tree, oauth_active, exchange.is_some(), placeholder_pascal.as_deref(), placeholder_kebab.as_deref());
         for root in &tree.roots {
             emit_group_types(&mut out, root, "");
         }
     }
 
+    // main()
     out.push_str("#[tokio::main(flavor = \"multi_thread\")]\nasync fn main() -> anyhow::Result<()> {\n    let cli = Cli::parse();\n");
+
+    // Built-in handlers for login / logout / placeholder-config subcommands.
     if oauth_active {
-        out.push_str("    if matches!(cli.cmd, Cmd::Login) {\n        auth::login().await?;\n        eprintln!(\"logged in\");\n        return Ok(());\n    }\n    if matches!(cli.cmd, Cmd::Logout) {\n        let removed = auth::logout().await?;\n        eprintln!(\"{}\", if removed { \"logged out\" } else { \"no stored token\" });\n        return Ok(());\n    }\n    let token = match cli.token {\n        Some(t) => Some(t),\n        None => auth::access_token().await?,\n    };\n");
-    } else {
-        out.push_str("    let token = cli.token;\n");
+        out.push_str("    if matches!(cli.cmd, Cmd::Login) {\n        auth::login().await?;\n        eprintln!(\"logged in\");\n        return Ok(());\n    }\n    if matches!(cli.cmd, Cmd::Logout) {\n        let removed = auth::logout().await?;\n        eprintln!(\"{}\", if removed { \"logged out\" } else { \"no stored token\" });\n        return Ok(());\n    }\n");
     }
-    out.push_str("    let client = ApiClient::new(cli.base_url, token)?;\n    let result: serde_json::Value = match cli.cmd {\n");
+    if let Some(pascal) = &placeholder_pascal {
+        let kebab = placeholder_kebab.as_ref().unwrap();
+        out.push_str(&format!(
+            "    if let Cmd::Set{pascal} {{ value }} = &cli.cmd {{\n        auth::write_persisted(\"{kebab}\", value)?;\n        eprintln!(\"persisted {kebab} = {{}}\", value);\n        return Ok(());\n    }}\n    if matches!(cli.cmd, Cmd::Unset{pascal}) {{\n        let removed = auth::delete_persisted(\"{kebab}\")?;\n        eprintln!(\"{{}}\", if removed {{ \"unset\" }} else {{ \"no persisted value\" }});\n        return Ok(());\n    }}\n    if matches!(cli.cmd, Cmd::Show{pascal}) {{\n        match auth::read_persisted(\"{kebab}\")? {{\n            Some(v) => println!(\"{{}}\", v),\n            None => eprintln!(\"(none)\"),\n        }}\n        return Ok(());\n    }}\n"
+        ));
+    }
+
+    // Resolve effective placeholder value (flag/env via clap → persisted default).
+    if let Some(snake) = &placeholder_snake {
+        let kebab = placeholder_kebab.as_ref().unwrap();
+        out.push_str(&format!(
+            "    let __resolved_{snake}: Option<String> = match cli.{snake}.clone() {{\n        Some(v) => Some(v),\n        None => auth::read_persisted(\"{kebab}\")?,\n    }};\n"
+        ));
+    }
+
+    out.push_str("    let client = ApiClient::new(cli.base_url)?;\n");
+    out.push_str("    let result: serde_json::Value = match cli.cmd {\n");
     if oauth_active {
         out.push_str("        Cmd::Login | Cmd::Logout => unreachable!(\"handled above\"),\n");
+    }
+    if placeholder_pascal.is_some() {
+        let pascal = placeholder_pascal.as_ref().unwrap();
+        out.push_str(&format!(
+            "        Cmd::Set{pascal} {{ .. }} | Cmd::Unset{pascal} | Cmd::Show{pascal} => unreachable!(\"handled above\"),\n"
+        ));
     }
     if ir.operations.is_empty() && !oauth_active {
         out.push_str("        Cmd::Noop => return Ok(()),\n");
     } else {
         for root in &tree.roots {
-            emit_root_match_arms(&mut out, root, "");
+            emit_root_match_arms(&mut out, root, "", oauth, exchange);
         }
     }
     out.push_str("    };\n    runtime::print_output(&result, cli.output)\n}\n");
@@ -212,10 +326,24 @@ fn emit_main_rs(ir: &Ir, cfg: &Config, bin_name: &str, oauth: Option<&OauthInfo>
     out
 }
 
-fn emit_root_enum(out: &mut String, tree: &TagTree, oauth_active: bool) {
+fn emit_root_enum(
+    out: &mut String,
+    tree: &TagTree,
+    oauth_active: bool,
+    exchange_active: bool,
+    placeholder_pascal: Option<&str>,
+    placeholder_kebab: Option<&str>,
+) {
     out.push_str("#[derive(Subcommand)]\nenum Cmd {\n");
     if oauth_active {
         out.push_str("    /// Run OAuth 2.0 authorization-code flow with PKCE; persists the access token.\n    Login,\n    /// Delete the stored OAuth token.\n    Logout,\n");
+    }
+    if exchange_active {
+        let pascal = placeholder_pascal.unwrap();
+        let kebab = placeholder_kebab.unwrap();
+        out.push_str(&format!(
+            "    /// Persist a default `{kebab}` so subsequent calls can omit `--{kebab}`.\n    Set{pascal} {{ value: String }},\n    /// Clear the persisted default `{kebab}`.\n    Unset{pascal},\n    /// Print the persisted default `{kebab}`.\n    Show{pascal},\n"
+        ));
     }
     for root in &tree.roots {
         if root.is_misc() {
@@ -260,31 +388,44 @@ fn emit_group_types(out: &mut String, group: &TagGroup, prefix: &str) {
     }
 }
 
-fn emit_root_match_arms(out: &mut String, root: &TagGroup, prefix: &str) {
+fn emit_root_match_arms(
+    out: &mut String,
+    root: &TagGroup,
+    prefix: &str,
+    oauth: Option<&OauthInfo>,
+    exchange: Option<&TokenExchangeInfo>,
+) {
     if root.is_misc() {
         for op in &root.direct_ops {
-            out.push_str(&render_op_match_arm(op, "Cmd", "        "));
+            out.push_str(&render_op_match_arm(op, "Cmd", "        ", oauth, exchange));
         }
         return;
     }
     let variant = pascal_case(&root.name);
     let q = qualified_pascal(prefix, &root.name);
     out.push_str(&format!("        Cmd::{variant}(__g) => match __g.cmd {{\n"));
-    emit_group_match_arms(out, root, &q, "            ");
+    emit_group_match_arms(out, root, &q, "            ", oauth, exchange);
     out.push_str("        },\n");
 }
 
-fn emit_group_match_arms(out: &mut String, group: &TagGroup, q: &str, indent: &str) {
+fn emit_group_match_arms(
+    out: &mut String,
+    group: &TagGroup,
+    q: &str,
+    indent: &str,
+    oauth: Option<&OauthInfo>,
+    exchange: Option<&TokenExchangeInfo>,
+) {
     let cmd_ty = format!("{q}Cmd");
     for child in &group.children {
         let child_variant = pascal_case(&child.name);
         let child_q = qualified_pascal(q, &child.name);
         out.push_str(&format!("{indent}{cmd_ty}::{child_variant}(__g) => match __g.cmd {{\n"));
-        emit_group_match_arms(out, child, &child_q, &format!("{indent}    "));
+        emit_group_match_arms(out, child, &child_q, &format!("{indent}    "), oauth, exchange);
         out.push_str(&format!("{indent}}},\n"));
     }
     for op in &group.direct_ops {
-        out.push_str(&render_op_match_arm(op, &cmd_ty, indent));
+        out.push_str(&render_op_match_arm(op, &cmd_ty, indent, oauth, exchange));
     }
 }
 
@@ -315,18 +456,68 @@ fn render_op_variant(op: &Operation, indent: &str) -> String {
     s
 }
 
-fn render_op_match_arm(op: &Operation, cmd_ty: &str, indent: &str) -> String {
+fn render_op_match_arm(
+    op: &Operation,
+    cmd_ty: &str,
+    indent: &str,
+    oauth: Option<&OauthInfo>,
+    exchange: Option<&TokenExchangeInfo>,
+) -> String {
     let variant = pascal_case(&op.id);
     let method_ident = snake_case(&op.id);
     let fields = collect_fields(op);
+
+    // Bearer resolution per op. Three modes:
+    //   - this op references the placeholder ⇒ resolve via RFC 8693
+    //     exchange (or pass `--token` through unchanged).
+    //   - oauth is active but op doesn't reference the placeholder ⇒
+    //     fall back to the main token (`--token` ⇒ stored ⇒ none).
+    //   - oauth not active ⇒ raw `--token` flag, possibly None.
+    let needs_exchange = exchange.is_some_and(|ex| op_uses_placeholder(op, &ex.placeholder));
+
+    let bearer_block = if needs_exchange {
+        let ex = exchange.unwrap();
+        let ph_snake = snake_case(&ex.placeholder);
+        let ph_kebab = kebab_case(&ex.placeholder);
+        let aud_fmt = ex.audience_template.replace(&format!("{{{}}}", ex.placeholder), "{}");
+        let res_let = match &ex.resource_template {
+            Some(rt) => {
+                let rt_fmt = rt.replace(&format!("{{{}}}", ex.placeholder), "{}");
+                format!("Some(format!(\"{}\", __slug))", escape_rust_string(&rt_fmt))
+            }
+            None => "None".into(),
+        };
+        let scope_let = if ex.extra_scope.is_empty() {
+            "None".into()
+        } else {
+            format!("Some(\"{}\")", escape_rust_string(&ex.extra_scope.join(" ")))
+        };
+        format!(
+            "if let Some(t) = cli.token.clone() {{ Some(t) }} else {{ \
+                let __slug = __resolved_{ph_snake}.clone().ok_or_else(|| \
+                    anyhow::anyhow!(\"--{ph_kebab} is required for this operation (or run `set-{ph_kebab} <slug>`)\"))?; \
+                let __aud = format!(\"{aud_fmt}\", __slug); \
+                let __res: Option<String> = {res_let}; \
+                let __scope: Option<&str> = {scope_let}; \
+                auth::audience_access_token(&__aud, __res.as_deref(), __scope).await? \
+            }}"
+        )
+    } else if oauth.is_some() {
+        "if let Some(t) = cli.token.clone() { Some(t) } else { auth::access_token().await? }".into()
+    } else {
+        "cli.token.clone()".into()
+    };
+
     if fields.is_empty() {
-        format!("{indent}{cmd_ty}::{variant} => client.{method_ident}().await?,\n")
+        format!(
+            "{indent}{cmd_ty}::{variant} => {{\n{indent}    let __bearer: Option<String> = {bearer_block};\n{indent}    client.{method_ident}(__bearer.as_deref()).await?\n{indent}}},\n",
+        )
     } else {
         let names: Vec<&str> = fields.iter().map(|f| f.ident.as_str()).collect();
         format!(
-            "{indent}{cmd_ty}::{variant} {{ {} }} => client.{method_ident}({}).await?,\n",
-            names.join(", "),
-            names.join(", "),
+            "{indent}{cmd_ty}::{variant} {{ {pat} }} => {{\n{indent}    let __bearer: Option<String> = {bearer_block};\n{indent}    client.{method_ident}(__bearer.as_deref(), {args}).await?\n{indent}}},\n",
+            pat = names.join(", "),
+            args = names.join(", "),
         )
     }
 }
@@ -417,7 +608,7 @@ fn qualified_pascal(prefix: &str, name: &str) -> String {
 
 fn emit_client_rs(ir: &Ir) -> String {
     let mut out = String::new();
-    out.push_str("// Generated by openapi-forge / generator-rust-clap; do not edit by hand.\n#![allow(clippy::too_many_arguments, clippy::needless_borrow)]\n\nuse anyhow::{anyhow, Context, Result};\nuse serde_json::Value;\n\nuse crate::runtime::parse_body_arg;\n\npub struct ApiClient {\n    http: reqwest::Client,\n    base_url: String,\n    token: Option<String>,\n}\n\nimpl ApiClient {\n    pub fn new(base_url: String, token: Option<String>) -> Result<Self> {\n        Ok(Self {\n            http: reqwest::Client::builder().build()?,\n            base_url: base_url.trim_end_matches('/').to_string(),\n            token,\n        })\n    }\n\n    fn req(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {\n        let mut b = self.http.request(method, format!(\"{}{}\", self.base_url, path));\n        if let Some(t) = &self.token { b = b.bearer_auth(t); }\n        b\n    }\n\n");
+    out.push_str("// Generated by openapi-forge / generator-rust-clap; do not edit by hand.\n#![allow(clippy::too_many_arguments, clippy::needless_borrow)]\n\nuse anyhow::{anyhow, Context, Result};\nuse serde_json::Value;\n\nuse crate::runtime::parse_body_arg;\n\npub struct ApiClient {\n    http: reqwest::Client,\n    base_url: String,\n}\n\nimpl ApiClient {\n    pub fn new(base_url: String) -> Result<Self> {\n        Ok(Self {\n            http: reqwest::Client::builder().build()?,\n            base_url: base_url.trim_end_matches('/').to_string(),\n        })\n    }\n\n    fn req(&self, token: Option<&str>, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {\n        let mut b = self.http.request(method, format!(\"{}{}\", self.base_url, path));\n        if let Some(t) = token { b = b.bearer_auth(t); }\n        b\n    }\n\n");
 
     for op in &ir.operations {
         out.push_str(&render_client_method(op));
@@ -432,7 +623,7 @@ fn render_client_method(op: &Operation) -> String {
     let http_method = method_path(&op.method);
     let path_template = &op.path_template;
 
-    let mut sig_args = Vec::new();
+    let mut sig_args: Vec<String> = vec!["__bearer: Option<&str>".into()];
     for p in &op.path_params {
         sig_args.push(format!("{}: String", snake_case(&p.name)));
     }
@@ -470,7 +661,7 @@ fn render_client_method(op: &Operation) -> String {
         ));
     }
     body.push_str(&format!(
-        "        let mut __r = self.req({http_method}, &__path);\n"
+        "        let mut __r = self.req(__bearer, {http_method}, &__path);\n"
     ));
 
     for p in &op.query_params {
@@ -648,32 +839,40 @@ fn emit_auth_rs(bin_name: &str, oa: &OauthInfo) -> String {
         .map(|s| format!("\"{}\"", escape_rust_string(s)))
         .collect::<Vec<_>>()
         .join(", ");
+    let client_secret_env = oa.config.client_secret_env.as_deref().unwrap_or("");
+    let exchange_active = oa.exchange.is_some();
 
-    AUTH_RS_TEMPLATE
+    let mut composed = String::with_capacity(AUTH_RS_PROLOGUE.len() + AUTH_RS_EXCHANGE_TAIL.len());
+    composed.push_str(AUTH_RS_PROLOGUE);
+    if exchange_active {
+        composed.push_str(AUTH_RS_EXCHANGE_TAIL);
+    }
+
+    composed
         .replace("__BIN_NAME__", bin_name)
         .replace("__CLIENT_ID__", &escape_rust_string(client_id))
         .replace("__AUTH_URL__", &escape_rust_string(auth_url))
         .replace("__TOKEN_URL__", &escape_rust_string(token_url))
         .replace("__REDIRECT_PORT__", &port.to_string())
         .replace("__SCOPES__", &scopes_lit)
+        .replace("__CLIENT_SECRET_ENV__", &escape_rust_string(client_secret_env))
 }
 
-const AUTH_RS_TEMPLATE: &str = r##"// Generated by openapi-forge / generator-rust-clap; do not edit by hand.
+const AUTH_RS_PROLOGUE: &str = r##"// Generated by openapi-forge / generator-rust-clap; do not edit by hand.
 //! OAuth 2.0 PKCE authorization-code flow + token persistence.
 //!
-//! - Loopback HTTP listener on 127.0.0.1:__REDIRECT_PORT__ accepts the
-//!   redirect, parses ?code= and ?state=, replies with a small HTML
-//!   page, and shuts down.
-//! - Token persists at the platform config dir under
-//!   `<bin>/auth.json` with mode 0600 on Unix.
-//! - `access_token()` refreshes lazily with a 30s skew.
+//! When `__CLIENT_SECRET_ENV__` resolves to a non-empty value at
+//! runtime, the runtime authenticates as a confidential client via
+//! `Authorization: Basic`. When unset, no client auth is sent (suitable
+//! for IdPs that accept public clients).
 
 #![allow(dead_code)]
 
 use anyhow::{anyhow, bail, Context, Result};
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::engine::general_purpose::{STANDARD as B64_STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine as _;
 use rand::RngCore;
+use reqwest::RequestBuilder;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
@@ -686,6 +885,7 @@ const AUTH_URL: &str = "__AUTH_URL__";
 const TOKEN_URL: &str = "__TOKEN_URL__";
 const REDIRECT_PORT: u16 = __REDIRECT_PORT__;
 const SCOPES: &[&str] = &[__SCOPES__];
+const CLIENT_SECRET_ENV: &str = "__CLIENT_SECRET_ENV__";
 const REFRESH_SKEW_SECS: u64 = 30;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -695,10 +895,8 @@ pub struct StoredToken {
     pub refresh_token: Option<String>,
     #[serde(default)]
     pub token_type: String,
-    /// Unix seconds when access_token expires; None if server didn't say.
     #[serde(default)]
     pub expires_at: Option<u64>,
-    /// Unix seconds when this token was obtained.
     pub obtained_at: u64,
     #[serde(default)]
     pub scope: Option<String>,
@@ -737,12 +935,61 @@ fn challenge_from(verifier: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
 }
 
-fn token_path() -> Result<PathBuf> {
+fn config_dir() -> Result<PathBuf> {
     let dirs = directories::ProjectDirs::from("", "", BIN_NAME)
         .context("computing config dir")?;
-    let dir = dirs.config_dir();
-    std::fs::create_dir_all(dir).context("creating config dir")?;
-    Ok(dir.join("auth.json"))
+    let dir = dirs.config_dir().to_path_buf();
+    std::fs::create_dir_all(&dir).context("creating config dir")?;
+    Ok(dir)
+}
+
+fn token_path() -> Result<PathBuf> {
+    Ok(config_dir()?.join("auth.json"))
+}
+
+fn persisted_path(name: &str) -> Result<PathBuf> {
+    let safe: String = name.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    Ok(config_dir()?.join(format!("{safe}.json")))
+}
+
+pub fn read_persisted(name: &str) -> Result<Option<String>> {
+    let p = persisted_path(name)?;
+    if !p.exists() { return Ok(None); }
+    let s = std::fs::read_to_string(&p).context("reading persisted value")?;
+    let v: serde_json::Value = serde_json::from_str(&s).context("parsing persisted value")?;
+    Ok(v.get("value").and_then(|x| x.as_str()).map(|x| x.to_string()))
+}
+
+pub fn write_persisted(name: &str, value: &str) -> Result<()> {
+    let p = persisted_path(name)?;
+    let json = serde_json::json!({ "value": value });
+    let s = serde_json::to_string_pretty(&json)?;
+    std::fs::write(&p, s).context("writing persisted value")?;
+    set_user_only_perms(&p)?;
+    Ok(())
+}
+
+pub fn delete_persisted(name: &str) -> Result<bool> {
+    let p = persisted_path(name)?;
+    if p.exists() {
+        std::fs::remove_file(&p).context("removing persisted value")?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+fn set_user_only_perms(_p: &std::path::Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perm = std::fs::metadata(_p)?.permissions();
+        perm.set_mode(0o600);
+        std::fs::set_permissions(_p, perm)?;
+    }
+    Ok(())
 }
 
 pub fn read_stored() -> Result<Option<StoredToken>> {
@@ -758,13 +1005,7 @@ fn write_stored(t: &StoredToken) -> Result<()> {
     let p = token_path()?;
     let s = serde_json::to_string_pretty(t).context("serializing token")?;
     std::fs::write(&p, &s).context("writing auth.json")?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perm = std::fs::metadata(&p)?.permissions();
-        perm.set_mode(0o600);
-        std::fs::set_permissions(&p, perm)?;
-    }
+    set_user_only_perms(&p)?;
     Ok(())
 }
 
@@ -778,14 +1019,34 @@ pub async fn logout() -> Result<bool> {
     }
 }
 
+/// Returns the value of the configured client-secret env var, or None
+/// when the env var is unset / blank.
+fn client_secret() -> Option<String> {
+    if CLIENT_SECRET_ENV.is_empty() {
+        return None;
+    }
+    std::env::var(CLIENT_SECRET_ENV).ok().filter(|s| !s.is_empty())
+}
+
+/// Attaches `Authorization: Basic` to a token-endpoint request when a
+/// client secret is configured. No-op for public clients.
+fn maybe_client_auth(b: RequestBuilder) -> RequestBuilder {
+    match client_secret() {
+        Some(secret) => {
+            let pair = format!("{}:{}", CLIENT_ID, secret);
+            let header = format!("Basic {}", B64_STANDARD.encode(pair));
+            b.header(reqwest::header::AUTHORIZATION, header)
+        }
+        None => b,
+    }
+}
+
 pub async fn login() -> Result<StoredToken> {
     let verifier = random_verifier();
     let challenge = challenge_from(&verifier);
     let state = random_state();
     let redirect_uri = format!("http://127.0.0.1:{}/callback", REDIRECT_PORT);
 
-    // Build the authorization URL by appending an x-www-form-urlencoded
-    // query string. We do this by hand to avoid a `url` crate dep.
     let scope_joined = SCOPES.join(" ");
     let mut params = vec![
         ("client_id", CLIENT_ID),
@@ -809,7 +1070,6 @@ pub async fn login() -> Result<StoredToken> {
     let _ = webbrowser::open(&auth_url);
     eprintln!("(if your browser doesn't open, paste the URL above)");
 
-    // Loopback callback server.
     let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", REDIRECT_PORT))
         .await
         .with_context(|| format!("binding 127.0.0.1:{} for OAuth callback", REDIRECT_PORT))?;
@@ -839,7 +1099,6 @@ pub async fn login() -> Result<StoredToken> {
         }
     }
 
-    // HTML response.
     let html = b"<!doctype html><html><body style=\"font-family:sans-serif\"><h2>Login complete</h2><p>You can close this window.</p></body></html>";
     let head = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -858,20 +1117,20 @@ pub async fn login() -> Result<StoredToken> {
         bail!("state mismatch (CSRF check failed)");
     }
 
-    // Exchange code for tokens.
     let http = reqwest::Client::new();
-    let resp = http
-        .post(TOKEN_URL)
-        .form(&[
-            ("grant_type", "authorization_code"),
-            ("code", code.as_str()),
-            ("redirect_uri", redirect_uri.as_str()),
-            ("client_id", CLIENT_ID),
-            ("code_verifier", verifier.as_str()),
-        ])
-        .send()
-        .await
-        .context("posting to token endpoint")?;
+    let mut form: Vec<(&str, String)> = vec![
+        ("grant_type", "authorization_code".into()),
+        ("code", code.clone()),
+        ("redirect_uri", redirect_uri.clone()),
+        ("code_verifier", verifier.clone()),
+    ];
+    if client_secret().is_none() {
+        // Public client: send client_id in the body.
+        form.push(("client_id", CLIENT_ID.to_string()));
+    }
+    let req = http.post(TOKEN_URL).form(&form);
+    let req = maybe_client_auth(req);
+    let resp = req.send().await.context("posting to token endpoint")?;
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
@@ -909,16 +1168,16 @@ pub async fn access_token() -> Result<Option<String>> {
     };
 
     let http = reqwest::Client::new();
-    let resp = http
-        .post(TOKEN_URL)
-        .form(&[
-            ("grant_type", "refresh_token"),
-            ("refresh_token", rt),
-            ("client_id", CLIENT_ID),
-        ])
-        .send()
-        .await
-        .context("refreshing OAuth token")?;
+    let mut form: Vec<(&str, String)> = vec![
+        ("grant_type", "refresh_token".into()),
+        ("refresh_token", rt.to_string()),
+    ];
+    if client_secret().is_none() {
+        form.push(("client_id", CLIENT_ID.to_string()));
+    }
+    let req = http.post(TOKEN_URL).form(&form);
+    let req = maybe_client_auth(req);
+    let resp = req.send().await.context("refreshing OAuth token")?;
     if !resp.status().is_success() {
         let _ = std::fs::remove_file(token_path()?);
         return Ok(None);
@@ -938,16 +1197,116 @@ pub async fn access_token() -> Result<Option<String>> {
 }
 "##;
 
+const AUTH_RS_EXCHANGE_TAIL: &str = r##"
+
+// ---------------------------------------------------------------------------
+// RFC 8693 standard token exchange — tenant / per-audience access tokens.
+// ---------------------------------------------------------------------------
+
+use std::collections::HashMap;
+use tokio::sync::Mutex;
+
+static EXCHANGE_CACHE: tokio::sync::OnceCell<Mutex<HashMap<String, StoredToken>>> =
+    tokio::sync::OnceCell::const_new();
+
+async fn cache() -> &'static Mutex<HashMap<String, StoredToken>> {
+    EXCHANGE_CACHE
+        .get_or_init(|| async { Mutex::new(HashMap::new()) })
+        .await
+}
+
+/// Returns a Bearer scoped to `audience`. Performs RFC 8693 standard
+/// token exchange against TOKEN_URL on first use per audience and
+/// caches the result in-process. Refreshes lazily on a 30s skew.
+pub async fn audience_access_token(
+    audience: &str,
+    resource: Option<&str>,
+    extra_scope: Option<&str>,
+) -> Result<Option<String>> {
+    {
+        let map = cache().await.lock().await;
+        if let Some(tok) = map.get(audience) {
+            let now = now_secs();
+            let stale = tok.expires_at.map(|e| e.saturating_sub(REFRESH_SKEW_SECS) <= now).unwrap_or(false);
+            if !stale {
+                return Ok(Some(tok.access_token.clone()));
+            }
+        }
+    }
+
+    let Some(subject) = access_token().await? else {
+        return Ok(None);
+    };
+
+    let http = reqwest::Client::new();
+    let mut form: Vec<(&str, String)> = vec![
+        ("grant_type", "urn:ietf:params:oauth:grant-type:token-exchange".into()),
+        ("subject_token", subject.clone()),
+        ("subject_token_type", "urn:ietf:params:oauth:token-type:access_token".into()),
+        ("requested_token_type", "urn:ietf:params:oauth:token-type:access_token".into()),
+        ("audience", audience.to_string()),
+    ];
+    if let Some(r) = resource {
+        form.push(("resource", r.to_string()));
+    }
+    if let Some(sc) = extra_scope.filter(|s| !s.is_empty()) {
+        form.push(("scope", sc.to_string()));
+    }
+    if client_secret().is_none() {
+        form.push(("client_id", CLIENT_ID.to_string()));
+    }
+    let req = http.post(TOKEN_URL).form(&form);
+    let req = maybe_client_auth(req);
+    let resp = req.send().await.context("posting RFC 8693 token exchange")?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        bail!(
+            "token exchange {status}: {body}\n\
+             (audience={audience}; if the IdP requires client authentication, \
+             set the `{}` env var to the client secret)",
+            CLIENT_SECRET_ENV,
+        );
+    }
+    let tr: TokenResponse = resp.json().await.context("parsing exchange response")?;
+    let now = now_secs();
+    let stored = StoredToken {
+        access_token: tr.access_token.clone(),
+        refresh_token: tr.refresh_token,
+        token_type: tr.token_type.unwrap_or_else(|| "bearer".into()),
+        expires_at: tr.expires_in.map(|s| now + s),
+        obtained_at: now,
+        scope: tr.scope,
+    };
+    let bearer = stored.access_token.clone();
+    cache().await.lock().await.insert(audience.to_string(), stored);
+    Ok(Some(bearer))
+}
+"##;
+
 // ---------------------------------------------------------------------------
 // README.md
 // ---------------------------------------------------------------------------
 
-fn emit_readme(ir: &Ir, bin_name: &str, oauth: bool) -> String {
+fn emit_readme(ir: &Ir, bin_name: &str, oauth: Option<&OauthInfo>) -> String {
     let prefix = env_prefix(bin_name);
-    let oauth_section = if oauth {
-        format!(
-            "\n## OAuth\n\nThis CLI was generated with OAuth 2.0 (PKCE authorization-code) wired up.\n\n```sh\n{bin_name} login    # opens a browser, persists the token\n{bin_name} logout   # deletes the stored token\n```\n\nThe token is stored at the platform config dir under `{bin_name}/auth.json` (mode 0600 on Unix).\nThe token is refreshed lazily on a 30-second skew.\n"
-        )
+    let oauth_section = if let Some(oa) = oauth {
+        let mut s = format!(
+            "\n## OAuth\n\nThis CLI was generated with OAuth 2.0 (PKCE authorization-code) wired up.\n\n```sh\n{bin_name} login    # opens a browser, persists the access token\n{bin_name} logout   # deletes the stored token\n```\n\nThe token is stored at the platform config dir under `{bin_name}/auth.json` (mode 0600 on Unix).\nThe token is refreshed lazily on a 30-second skew.\n"
+        );
+        if let Some(env) = oa.config.client_secret_env.as_deref().filter(|s| !s.is_empty()) {
+            s.push_str(&format!(
+                "\nThe configured OAuth client is **confidential** — set `{env}` to the client secret in your shell before running `{bin_name} login` (or any tenant-scoped operation).\n"
+            ));
+        }
+        if let Some(ex) = &oa.exchange {
+            let kebab = kebab_case(&ex.placeholder);
+            s.push_str(&format!(
+                "\n## Per-`{kebab}` token exchange (RFC 8693)\n\nOperations whose path includes `{{{ph}}}` use a tenant-scoped JWT minted via standard RFC 8693 token exchange against the IdP's token endpoint.\n\n```sh\n{bin_name} --{kebab} <slug> <op>           # one-off\n{bin_name} set-{kebab} <slug>                # persist a default\n{bin_name} unset-{kebab}                     # clear it\n{bin_name} show-{kebab}                      # show the current default\n```\n",
+                ph = ex.placeholder,
+            ));
+        }
+        s
     } else {
         String::new()
     };
@@ -974,4 +1333,16 @@ fn escape_doc(s: &str) -> String {
 fn json_string(s: &str) -> String {
     let escaped = s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n");
     format!("\"{escaped}\"")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_placeholders_simple() {
+        assert_eq!(extract_placeholders("urn:x:tenant:{tenant}"), vec!["tenant"]);
+        assert_eq!(extract_placeholders("https://api/{a}/{b}/items"), vec!["a", "b"]);
+        assert_eq!(extract_placeholders("static"), Vec::<String>::new());
+    }
 }

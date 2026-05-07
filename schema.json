@@ -21,7 +21,7 @@
         "clientId": {
           "type": "string",
           "minLength": 1,
-          "description": "Public OAuth client ID; never derivable from the spec."
+          "description": "OAuth client ID; never derivable from the spec."
         },
         "schemeId": {
           "type": "string",
@@ -38,6 +38,11 @@
           "type": "array",
           "items": { "type": "string" },
           "description": "Scope override. Defaults to the union of per-op scopes referencing the chosen oauth2 scheme."
+        },
+        "clientSecretEnv": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Env var the generated CLI reads at runtime for the client secret. When set, the CLI sends `Authorization: Basic` on every token-endpoint call (treats the client as confidential). Required for IdPs that mandate client auth for RFC 8693 token exchange (e.g. Keycloak 26 standard token exchange)."
         }
       }
     }
