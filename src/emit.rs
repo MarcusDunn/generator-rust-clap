@@ -32,7 +32,10 @@ pub fn all(ir: &Ir, cfg: &Config) -> GenerationOutput {
         OutputFile::text("README.md", emit_readme(ir, &bin_name, oauth.as_ref())),
     ];
     if let Some(oa) = &oauth {
-        files.push(OutputFile::text("src/auth.rs", emit_auth_rs(&bin_name, oa)));
+        files.push(OutputFile::text(
+            "src/auth.rs",
+            emit_auth_rs(&bin_name, oa, &default_base_url(ir, cfg)),
+        ));
     }
 
     GenerationOutput { files, diagnostics: vec![] }
@@ -208,6 +211,7 @@ base64 = "0.22"
 rand = "0.8"
 webbrowser = "1"
 directories = "6"
+toml = "0.8"
 "#
     } else {
         ""
@@ -260,8 +264,24 @@ fn emit_main_rs(ir: &Ir, cfg: &Config, bin_name: &str, oauth: Option<&OauthInfo>
     }
     out.push_str("mod client;\nmod runtime;\n\nuse clap::{Args, CommandFactory, Parser, Subcommand};\nuse client::ApiClient;\nuse runtime::OutputMode;\n\n");
 
+    let base_url_decl = if oauth_active {
+        format!(
+            "    /// API base URL. When unset, falls back to the active profile, then the spec default.\n    #[arg(long, global = true, env = \"{prefix}_BASE_URL\")]\n    base_url: Option<String>,\n\n"
+        )
+    } else {
+        format!(
+            "    /// API base URL.\n    #[arg(long, global = true, env = \"{prefix}_BASE_URL\", default_value = \"{base_url}\")]\n    base_url: String,\n\n"
+        )
+    };
+    let profile_decl = if oauth_active {
+        format!(
+            "    /// Profile to use; bundles base_url / auth_url / token_url / client_id / client_secret. Default: \"default\".\n    #[arg(long, global = true, env = \"{prefix}_PROFILE\", default_value = \"default\")]\n    profile: String,\n\n"
+        )
+    } else {
+        String::new()
+    };
     out.push_str(&format!(
-        "#[derive(Parser)]\n#[command(name = \"{bin_name}\", version = \"{version}\", about = \"{title}\", long_about = None)]\nstruct Cli {{\n    /// API base URL.\n    #[arg(long, global = true, env = \"{prefix}_BASE_URL\", default_value = \"{base_url}\")]\n    base_url: String,\n\n    /// Bearer token. Overrides any stored OAuth or exchanged token.\n    #[arg(long, global = true, env = \"{prefix}_TOKEN\")]\n    token: Option<String>,\n\n    /// Output mode for response bodies.\n    #[arg(long, global = true, value_enum, default_value_t = OutputMode::Json)]\n    output: OutputMode,\n\n"
+        "#[derive(Parser)]\n#[command(name = \"{bin_name}\", version = \"{version}\", about = \"{title}\", long_about = None)]\nstruct Cli {{\n{base_url_decl}    /// Bearer token. Overrides any stored OAuth or exchanged token.\n    #[arg(long, global = true, env = \"{prefix}_TOKEN\")]\n    token: Option<String>,\n\n    /// Output mode for response bodies.\n    #[arg(long, global = true, value_enum, default_value_t = OutputMode::Json)]\n    output: OutputMode,\n\n{profile_decl}"
     ));
 
     if let (Some(kebab), Some(snake)) = (&placeholder_kebab, &placeholder_snake) {
@@ -290,14 +310,19 @@ fn emit_main_rs(ir: &Ir, cfg: &Config, bin_name: &str, oauth: Option<&OauthInfo>
         "    if let Cmd::Completion {{ shell }} = cli.cmd {{\n        let mut cmd = Cli::command();\n        clap_complete::generate(shell, &mut cmd, \"{bin_name}\", &mut std::io::stdout());\n        return Ok(());\n    }}\n"
     ));
 
+    // Profile bootstrap + legacy migration (idempotent, run every invocation).
+    if oauth_active {
+        out.push_str("    auth::migrate_legacy()?;\n    auth::bootstrap_default_profile_if_missing()?;\n");
+    }
+
     // Built-in handlers for login / logout / placeholder-config subcommands.
     if oauth_active {
-        out.push_str("    if matches!(cli.cmd, Cmd::Login) {\n        auth::login().await?;\n        eprintln!(\"logged in\");\n        return Ok(());\n    }\n    if matches!(cli.cmd, Cmd::Logout) {\n        let removed = auth::logout().await?;\n        eprintln!(\"{}\", if removed { \"logged out\" } else { \"no stored token\" });\n        return Ok(());\n    }\n");
+        out.push_str("    if matches!(cli.cmd, Cmd::Login) {\n        auth::login(&cli.profile).await?;\n        eprintln!(\"logged in (profile: {})\", cli.profile);\n        return Ok(());\n    }\n    if matches!(cli.cmd, Cmd::Logout) {\n        let removed = auth::logout(&cli.profile).await?;\n        eprintln!(\"{}\", if removed { \"logged out\" } else { \"no stored token\" });\n        return Ok(());\n    }\n");
     }
     if let Some(pascal) = &placeholder_pascal {
         let kebab = placeholder_kebab.as_ref().unwrap();
         out.push_str(&format!(
-            "    if let Cmd::Set{pascal} {{ value }} = &cli.cmd {{\n        auth::write_persisted(\"{kebab}\", value)?;\n        eprintln!(\"persisted {kebab} = {{}}\", value);\n        return Ok(());\n    }}\n    if matches!(cli.cmd, Cmd::Unset{pascal}) {{\n        let removed = auth::delete_persisted(\"{kebab}\")?;\n        eprintln!(\"{{}}\", if removed {{ \"unset\" }} else {{ \"no persisted value\" }});\n        return Ok(());\n    }}\n    if matches!(cli.cmd, Cmd::Show{pascal}) {{\n        match auth::read_persisted(\"{kebab}\")? {{\n            Some(v) => println!(\"{{}}\", v),\n            None => eprintln!(\"(none)\"),\n        }}\n        return Ok(());\n    }}\n"
+            "    if let Cmd::Set{pascal} {{ value }} = &cli.cmd {{\n        auth::write_persisted(&cli.profile, \"{kebab}\", value)?;\n        eprintln!(\"persisted {kebab} = {{}} (profile: {{}})\", value, cli.profile);\n        return Ok(());\n    }}\n    if matches!(cli.cmd, Cmd::Unset{pascal}) {{\n        let removed = auth::delete_persisted(&cli.profile, \"{kebab}\")?;\n        eprintln!(\"{{}}\", if removed {{ \"unset\" }} else {{ \"no persisted value\" }});\n        return Ok(());\n    }}\n    if matches!(cli.cmd, Cmd::Show{pascal}) {{\n        match auth::read_persisted(&cli.profile, \"{kebab}\")? {{\n            Some(v) => println!(\"{{}}\", v),\n            None => eprintln!(\"(none)\"),\n        }}\n        return Ok(());\n    }}\n"
         ));
     }
 
@@ -305,11 +330,15 @@ fn emit_main_rs(ir: &Ir, cfg: &Config, bin_name: &str, oauth: Option<&OauthInfo>
     if let Some(snake) = &placeholder_snake {
         let kebab = placeholder_kebab.as_ref().unwrap();
         out.push_str(&format!(
-            "    let __resolved_{snake}: Option<String> = match cli.{snake}.clone() {{\n        Some(v) => Some(v),\n        None => auth::read_persisted(\"{kebab}\")?,\n    }};\n"
+            "    let __resolved_{snake}: Option<String> = match cli.{snake}.clone() {{\n        Some(v) => Some(v),\n        None => auth::read_persisted(&cli.profile, \"{kebab}\")?,\n    }};\n"
         ));
     }
 
-    out.push_str("    let client = ApiClient::new(cli.base_url)?;\n");
+    if oauth_active {
+        out.push_str("    let __base_url = auth::resolve_base_url(&cli.profile, cli.base_url.as_deref())?;\n    let client = ApiClient::new(__base_url)?;\n");
+    } else {
+        out.push_str("    let client = ApiClient::new(cli.base_url)?;\n");
+    }
     out.push_str("    let result: serde_json::Value = match cli.cmd {\n");
     out.push_str("        Cmd::Completion { .. } => unreachable!(\"handled above\"),\n");
     if oauth_active {
@@ -545,11 +574,11 @@ fn render_op_match_arm(
                 let __aud = format!(\"{aud_fmt}\", __slug); \
                 let __res: Option<String> = {res_let}; \
                 let __scope: Option<&str> = {scope_let}; \
-                auth::audience_access_token(&__aud, __res.as_deref(), __scope).await? \
+                auth::audience_access_token(&cli.profile, &__aud, __res.as_deref(), __scope).await? \
             }}"
         )
     } else if oauth.is_some() {
-        "if let Some(t) = cli.token.clone() { Some(t) } else { auth::access_token().await? }".into()
+        "if let Some(t) = cli.token.clone() { Some(t) } else { auth::access_token(&cli.profile).await? }".into()
     } else {
         "cli.token.clone()".into()
     };
@@ -869,7 +898,7 @@ pub fn print_output(v: &Value, mode: OutputMode) -> Result<()> {
 // src/auth.rs
 // ---------------------------------------------------------------------------
 
-fn emit_auth_rs(bin_name: &str, oa: &OauthInfo) -> String {
+fn emit_auth_rs(bin_name: &str, oa: &OauthInfo, base_url_default: &str) -> String {
     let auth_url = oa.flow.authorization_url.as_deref().unwrap();
     let token_url = oa.flow.token_url.as_deref().unwrap();
     let client_id = &oa.config.client_id;
@@ -894,6 +923,7 @@ fn emit_auth_rs(bin_name: &str, oa: &OauthInfo) -> String {
         .replace("__CLIENT_ID__", &escape_rust_string(client_id))
         .replace("__AUTH_URL__", &escape_rust_string(auth_url))
         .replace("__TOKEN_URL__", &escape_rust_string(token_url))
+        .replace("__BASE_URL_DEFAULT__", &escape_rust_string(base_url_default))
         .replace("__REDIRECT_PORT__", &port.to_string())
         .replace("__SCOPES__", &scopes_lit)
         .replace("__CLIENT_SECRET_ENV__", &escape_rust_string(client_secret_env))
@@ -901,12 +931,11 @@ fn emit_auth_rs(bin_name: &str, oa: &OauthInfo) -> String {
 }
 
 const AUTH_RS_PROLOGUE: &str = r##"// Generated by openapi-forge / generator-rust-clap; do not edit by hand.
-//! OAuth 2.0 PKCE authorization-code flow + token persistence.
+//! OAuth 2.0 PKCE authorization-code flow + token persistence + profiles.
 //!
-//! When `__CLIENT_SECRET_ENV__` resolves to a non-empty value at
-//! runtime, the runtime authenticates as a confidential client via
-//! `Authorization: Basic`. When unset, no client auth is sent (suitable
-//! for IdPs that accept public clients).
+//! Profiles bundle deployment-specific settings (URLs, client id/secret)
+//! under named blocks in `<config_dir>/config.toml`. The `default`
+//! profile is auto-populated from spec values on first run.
 
 #![allow(dead_code)]
 
@@ -917,33 +946,175 @@ use rand::RngCore;
 use reqwest::RequestBuilder;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const BIN_NAME: &str = "__BIN_NAME__";
-const CLIENT_ID: &str = "__CLIENT_ID__";
+const CLIENT_ID_DEFAULT: &str = "__CLIENT_ID__";
 const AUTH_URL_DEFAULT: &str = "__AUTH_URL__";
 const TOKEN_URL_DEFAULT: &str = "__TOKEN_URL__";
+const BASE_URL_DEFAULT: &str = "__BASE_URL_DEFAULT__";
+const BASE_URL_ENV: &str = "__PREFIX___BASE_URL";
 const AUTH_URL_ENV: &str = "__PREFIX___AUTH_URL";
 const TOKEN_URL_ENV: &str = "__PREFIX___TOKEN_URL";
+const CLIENT_ID_ENV: &str = "__PREFIX___CLIENT_ID";
 const REDIRECT_PORT: u16 = __REDIRECT_PORT__;
 const SCOPES: &[&str] = &[__SCOPES__];
 const CLIENT_SECRET_ENV: &str = "__CLIENT_SECRET_ENV__";
 const REFRESH_SKEW_SECS: u64 = 30;
+pub const DEFAULT_PROFILE: &str = "default";
 
-fn auth_endpoint() -> String {
-    std::env::var(AUTH_URL_ENV)
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| AUTH_URL_DEFAULT.to_string())
+// =====================================================================
+// Profile config (TOML at <config_dir>/config.toml)
+// =====================================================================
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct Profile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret: Option<String>,
 }
 
-fn token_endpoint() -> String {
-    std::env::var(TOKEN_URL_ENV)
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| TOKEN_URL_DEFAULT.to_string())
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct ConfigFile {
+    #[serde(default)]
+    pub profiles: BTreeMap<String, Profile>,
+}
+
+fn config_toml_path() -> Result<PathBuf> {
+    Ok(config_dir()?.join("config.toml"))
+}
+
+pub fn read_config() -> Result<ConfigFile> {
+    let p = config_toml_path()?;
+    if !p.exists() { return Ok(ConfigFile::default()); }
+    let s = std::fs::read_to_string(&p).context("reading config.toml")?;
+    toml::from_str(&s).context("parsing config.toml")
+}
+
+pub fn write_config(cfg: &ConfigFile) -> Result<()> {
+    let p = config_toml_path()?;
+    let s = toml::to_string_pretty(cfg).context("serializing config.toml")?;
+    std::fs::write(&p, s).context("writing config.toml")?;
+    set_user_only_perms(&p)?;
+    Ok(())
+}
+
+/// Writes a `[profiles.default]` block populated from spec values when
+/// `config.toml` does not yet exist. Idempotent — returns immediately
+/// if the file already exists.
+pub fn bootstrap_default_profile_if_missing() -> Result<()> {
+    let p = config_toml_path()?;
+    if p.exists() { return Ok(()); }
+    let mut cfg = ConfigFile::default();
+    let mut prof = Profile::default();
+    if !BASE_URL_DEFAULT.is_empty() { prof.base_url = Some(BASE_URL_DEFAULT.into()); }
+    if !AUTH_URL_DEFAULT.is_empty() { prof.auth_url = Some(AUTH_URL_DEFAULT.into()); }
+    if !TOKEN_URL_DEFAULT.is_empty() { prof.token_url = Some(TOKEN_URL_DEFAULT.into()); }
+    if !CLIENT_ID_DEFAULT.is_empty() { prof.client_id = Some(CLIENT_ID_DEFAULT.into()); }
+    cfg.profiles.insert(DEFAULT_PROFILE.into(), prof);
+    write_config(&cfg)?;
+    Ok(())
+}
+
+/// One-shot migration: move legacy `<config_dir>/auth.json` and
+/// `<config_dir>/*.json` to `<config_dir>/profiles/default/*`.
+/// Idempotent — safe to call on every invocation.
+pub fn migrate_legacy() -> Result<()> {
+    let dir = config_dir()?;
+    let target_dir = profile_dir(DEFAULT_PROFILE)?;
+
+    let legacy = dir.join("auth.json");
+    if legacy.exists() {
+        let target = target_dir.join("auth.json");
+        let _ = std::fs::rename(&legacy, &target);
+    }
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for e in entries.flatten() {
+            let path = e.path();
+            if path.is_file() && path.extension().is_some_and(|x| x == "json") {
+                if let Some(name) = path.file_name() {
+                    let dest = target_dir.join(name);
+                    if !dest.exists() {
+                        let _ = std::fs::rename(&path, &dest);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn sanitize(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect()
+}
+
+// =====================================================================
+// Resolution chain (override → env → profile → spec default)
+// =====================================================================
+
+pub fn resolve_base_url(profile: &str, override_value: Option<&str>) -> Result<String> {
+    if let Some(v) = override_value.filter(|s| !s.is_empty()) { return Ok(v.into()); }
+    let cfg = read_config()?;
+    if let Some(p) = cfg.profiles.get(profile) {
+        if let Some(v) = &p.base_url { return Ok(v.clone()); }
+    }
+    Ok(BASE_URL_DEFAULT.into())
+}
+
+pub fn resolve_auth_url(profile: &str) -> Result<String> {
+    if let Ok(v) = std::env::var(AUTH_URL_ENV) { if !v.is_empty() { return Ok(v); } }
+    let cfg = read_config()?;
+    if let Some(p) = cfg.profiles.get(profile) {
+        if let Some(v) = &p.auth_url { return Ok(v.clone()); }
+    }
+    Ok(AUTH_URL_DEFAULT.into())
+}
+
+pub fn resolve_token_url(profile: &str) -> Result<String> {
+    if let Ok(v) = std::env::var(TOKEN_URL_ENV) { if !v.is_empty() { return Ok(v); } }
+    let cfg = read_config()?;
+    if let Some(p) = cfg.profiles.get(profile) {
+        if let Some(v) = &p.token_url { return Ok(v.clone()); }
+    }
+    Ok(TOKEN_URL_DEFAULT.into())
+}
+
+pub fn resolve_client_id(profile: &str) -> Result<String> {
+    if let Ok(v) = std::env::var(CLIENT_ID_ENV) { if !v.is_empty() { return Ok(v); } }
+    let cfg = read_config()?;
+    if let Some(p) = cfg.profiles.get(profile) {
+        if let Some(v) = &p.client_id { return Ok(v.clone()); }
+    }
+    Ok(CLIENT_ID_DEFAULT.into())
+}
+
+/// Resolves the client secret per profile. Chain:
+///   profile literal → env var named by CLIENT_SECRET_ENV → None.
+pub fn resolve_client_secret_value(profile: &str) -> Result<Option<String>> {
+    let cfg = read_config()?;
+    if let Some(p) = cfg.profiles.get(profile) {
+        if let Some(v) = &p.client_secret {
+            if !v.is_empty() { return Ok(Some(v.clone())); }
+        }
+    }
+    if !CLIENT_SECRET_ENV.is_empty() {
+        if let Ok(v) = std::env::var(CLIENT_SECRET_ENV) {
+            if !v.is_empty() { return Ok(Some(v)); }
+        }
+    }
+    Ok(None)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1001,27 +1172,30 @@ fn config_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
-fn token_path() -> Result<PathBuf> {
-    Ok(config_dir()?.join("auth.json"))
+pub fn profile_dir(profile: &str) -> Result<PathBuf> {
+    let dir = config_dir()?.join("profiles").join(sanitize(profile));
+    std::fs::create_dir_all(&dir).context("creating profile dir")?;
+    Ok(dir)
 }
 
-fn persisted_path(name: &str) -> Result<PathBuf> {
-    let safe: String = name.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
-        .collect();
-    Ok(config_dir()?.join(format!("{safe}.json")))
+fn token_path(profile: &str) -> Result<PathBuf> {
+    Ok(profile_dir(profile)?.join("auth.json"))
 }
 
-pub fn read_persisted(name: &str) -> Result<Option<String>> {
-    let p = persisted_path(name)?;
+fn persisted_path(profile: &str, name: &str) -> Result<PathBuf> {
+    Ok(profile_dir(profile)?.join(format!("{}.json", sanitize(name))))
+}
+
+pub fn read_persisted(profile: &str, name: &str) -> Result<Option<String>> {
+    let p = persisted_path(profile, name)?;
     if !p.exists() { return Ok(None); }
     let s = std::fs::read_to_string(&p).context("reading persisted value")?;
     let v: serde_json::Value = serde_json::from_str(&s).context("parsing persisted value")?;
     Ok(v.get("value").and_then(|x| x.as_str()).map(|x| x.to_string()))
 }
 
-pub fn write_persisted(name: &str, value: &str) -> Result<()> {
-    let p = persisted_path(name)?;
+pub fn write_persisted(profile: &str, name: &str, value: &str) -> Result<()> {
+    let p = persisted_path(profile, name)?;
     let json = serde_json::json!({ "value": value });
     let s = serde_json::to_string_pretty(&json)?;
     std::fs::write(&p, s).context("writing persisted value")?;
@@ -1029,8 +1203,8 @@ pub fn write_persisted(name: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn delete_persisted(name: &str) -> Result<bool> {
-    let p = persisted_path(name)?;
+pub fn delete_persisted(profile: &str, name: &str) -> Result<bool> {
+    let p = persisted_path(profile, name)?;
     if p.exists() {
         std::fs::remove_file(&p).context("removing persisted value")?;
         Ok(true)
@@ -1050,8 +1224,8 @@ fn set_user_only_perms(_p: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-pub fn read_stored() -> Result<Option<StoredToken>> {
-    let p = token_path()?;
+pub fn read_stored(profile: &str) -> Result<Option<StoredToken>> {
+    let p = token_path(profile)?;
     if !p.exists() {
         return Ok(None);
     }
@@ -1059,16 +1233,16 @@ pub fn read_stored() -> Result<Option<StoredToken>> {
     Ok(Some(serde_json::from_str(&s).context("parsing auth.json")?))
 }
 
-fn write_stored(t: &StoredToken) -> Result<()> {
-    let p = token_path()?;
+fn write_stored(profile: &str, t: &StoredToken) -> Result<()> {
+    let p = token_path(profile)?;
     let s = serde_json::to_string_pretty(t).context("serializing token")?;
     std::fs::write(&p, &s).context("writing auth.json")?;
     set_user_only_perms(&p)?;
     Ok(())
 }
 
-pub async fn logout() -> Result<bool> {
-    let p = token_path()?;
+pub async fn logout(profile: &str) -> Result<bool> {
+    let p = token_path(profile)?;
     if p.exists() {
         std::fs::remove_file(&p).context("removing auth.json")?;
         Ok(true)
@@ -1077,51 +1251,43 @@ pub async fn logout() -> Result<bool> {
     }
 }
 
-/// Returns the value of the configured client-secret env var, or None
-/// when the env var is unset / blank.
-fn client_secret() -> Option<String> {
-    if CLIENT_SECRET_ENV.is_empty() {
-        return None;
-    }
-    std::env::var(CLIENT_SECRET_ENV).ok().filter(|s| !s.is_empty())
-}
-
 /// Attaches `Authorization: Basic` to a token-endpoint request when a
-/// client secret is configured. No-op for public clients.
-fn maybe_client_auth(b: RequestBuilder) -> RequestBuilder {
-    match client_secret() {
-        Some(secret) => {
-            let pair = format!("{}:{}", CLIENT_ID, secret);
-            let header = format!("Basic {}", B64_STANDARD.encode(pair));
-            b.header(reqwest::header::AUTHORIZATION, header)
-        }
-        None => b,
-    }
+/// client secret is resolvable for `profile`. No-op for public clients.
+fn maybe_client_auth(b: RequestBuilder, profile: &str) -> RequestBuilder {
+    let secret = match resolve_client_secret_value(profile) {
+        Ok(Some(v)) => v,
+        _ => return b,
+    };
+    let client_id = resolve_client_id(profile).unwrap_or_else(|_| CLIENT_ID_DEFAULT.into());
+    let pair = format!("{}:{}", client_id, secret);
+    let header = format!("Basic {}", B64_STANDARD.encode(pair));
+    b.header(reqwest::header::AUTHORIZATION, header)
 }
 
-pub async fn login() -> Result<StoredToken> {
+pub async fn login(profile: &str) -> Result<StoredToken> {
     let verifier = random_verifier();
     let challenge = challenge_from(&verifier);
     let state = random_state();
     let redirect_uri = format!("http://127.0.0.1:{}/callback", REDIRECT_PORT);
+    let client_id = resolve_client_id(profile)?;
 
     let scope_joined = SCOPES.join(" ");
-    let mut params = vec![
-        ("client_id", CLIENT_ID),
-        ("response_type", "code"),
-        ("redirect_uri", redirect_uri.as_str()),
-        ("code_challenge", challenge.as_str()),
-        ("code_challenge_method", "S256"),
-        ("state", state.as_str()),
+    let mut params: Vec<(&str, String)> = vec![
+        ("client_id", client_id.clone()),
+        ("response_type", "code".into()),
+        ("redirect_uri", redirect_uri.clone()),
+        ("code_challenge", challenge.clone()),
+        ("code_challenge_method", "S256".into()),
+        ("state", state.clone()),
     ];
     if !scope_joined.is_empty() {
-        params.push(("scope", scope_joined.as_str()));
+        params.push(("scope", scope_joined.clone()));
     }
     let qs: Vec<String> = params
         .iter()
         .map(|(k, v)| format!("{}={}", k, urlencoding::encode(v)))
         .collect();
-    let auth_base = auth_endpoint();
+    let auth_base = resolve_auth_url(profile)?;
     let join = if auth_base.contains('?') { "&" } else { "?" };
     let auth_url = format!("{}{}{}", auth_base, join, qs.join("&"));
 
@@ -1183,12 +1349,11 @@ pub async fn login() -> Result<StoredToken> {
         ("redirect_uri", redirect_uri.clone()),
         ("code_verifier", verifier.clone()),
     ];
-    if client_secret().is_none() {
-        // Public client: send client_id in the body.
-        form.push(("client_id", CLIENT_ID.to_string()));
+    if resolve_client_secret_value(profile)?.is_none() {
+        form.push(("client_id", client_id.clone()));
     }
-    let req = http.post(&token_endpoint()).form(&form);
-    let req = maybe_client_auth(req);
+    let req = http.post(resolve_token_url(profile)?).form(&form);
+    let req = maybe_client_auth(req, profile);
     let resp = req.send().await.context("posting to token endpoint")?;
     if !resp.status().is_success() {
         let status = resp.status();
@@ -1206,12 +1371,12 @@ pub async fn login() -> Result<StoredToken> {
         obtained_at: now,
         scope: tr.scope,
     };
-    write_stored(&stored)?;
+    write_stored(profile, &stored)?;
     Ok(stored)
 }
 
-pub async fn access_token() -> Result<Option<String>> {
-    let Some(t) = read_stored()? else {
+pub async fn access_token(profile: &str) -> Result<Option<String>> {
+    let Some(t) = read_stored(profile)? else {
         return Ok(None);
     };
     let now = now_secs();
@@ -1231,14 +1396,15 @@ pub async fn access_token() -> Result<Option<String>> {
         ("grant_type", "refresh_token".into()),
         ("refresh_token", rt.to_string()),
     ];
-    if client_secret().is_none() {
-        form.push(("client_id", CLIENT_ID.to_string()));
+    let client_id = resolve_client_id(profile)?;
+    if resolve_client_secret_value(profile)?.is_none() {
+        form.push(("client_id", client_id));
     }
-    let req = http.post(&token_endpoint()).form(&form);
-    let req = maybe_client_auth(req);
+    let req = http.post(resolve_token_url(profile)?).form(&form);
+    let req = maybe_client_auth(req, profile);
     let resp = req.send().await.context("refreshing OAuth token")?;
     if !resp.status().is_success() {
-        let _ = std::fs::remove_file(token_path()?);
+        let _ = std::fs::remove_file(token_path(profile)?);
         return Ok(None);
     }
     let tr: TokenResponse = resp.json().await.context("parsing refresh response")?;
@@ -1251,8 +1417,14 @@ pub async fn access_token() -> Result<Option<String>> {
         obtained_at: now2,
         scope: tr.scope.or(t.scope),
     };
-    write_stored(&stored)?;
+    write_stored(profile, &stored)?;
     Ok(Some(stored.access_token))
+}
+
+pub fn list_profile_names() -> Vec<String> {
+    read_config()
+        .map(|cfg| cfg.profiles.keys().cloned().collect())
+        .unwrap_or_default()
 }
 "##;
 
@@ -1274,17 +1446,20 @@ async fn cache() -> &'static Mutex<HashMap<String, StoredToken>> {
         .await
 }
 
-/// Returns a Bearer scoped to `audience`. Performs RFC 8693 standard
-/// token exchange against TOKEN_URL on first use per audience and
-/// caches the result in-process. Refreshes lazily on a 30s skew.
+/// Returns a Bearer scoped to `audience` for the given `profile`.
+/// Performs RFC 8693 standard token exchange against the token URL on
+/// first use per (profile, audience) and caches the result in-process.
+/// Refreshes lazily on a 30s skew.
 pub async fn audience_access_token(
+    profile: &str,
     audience: &str,
     resource: Option<&str>,
     extra_scope: Option<&str>,
 ) -> Result<Option<String>> {
+    let cache_key = format!("{profile}\x00{audience}");
     {
         let map = cache().await.lock().await;
-        if let Some(tok) = map.get(audience) {
+        if let Some(tok) = map.get(&cache_key) {
             let now = now_secs();
             let stale = tok.expires_at.map(|e| e.saturating_sub(REFRESH_SKEW_SECS) <= now).unwrap_or(false);
             if !stale {
@@ -1293,7 +1468,7 @@ pub async fn audience_access_token(
         }
     }
 
-    let Some(subject) = access_token().await? else {
+    let Some(subject) = access_token(profile).await? else {
         return Ok(None);
     };
 
@@ -1311,11 +1486,11 @@ pub async fn audience_access_token(
     if let Some(sc) = extra_scope.filter(|s| !s.is_empty()) {
         form.push(("scope", sc.to_string()));
     }
-    if client_secret().is_none() {
-        form.push(("client_id", CLIENT_ID.to_string()));
+    if resolve_client_secret_value(profile)?.is_none() {
+        form.push(("client_id", resolve_client_id(profile)?));
     }
-    let req = http.post(&token_endpoint()).form(&form);
-    let req = maybe_client_auth(req);
+    let req = http.post(resolve_token_url(profile)?).form(&form);
+    let req = maybe_client_auth(req, profile);
     let resp = req.send().await.context("posting RFC 8693 token exchange")?;
     if !resp.status().is_success() {
         let status = resp.status();
@@ -1323,8 +1498,10 @@ pub async fn audience_access_token(
         bail!(
             "token exchange {status}: {body}\n\
              (audience={audience}; if the IdP requires client authentication, \
-             set the `{}` env var to the client secret)",
+             set the `{}` env var to the client secret OR add `client_secret` \
+             to the `[profiles.{}]` block of `<config_dir>/config.toml`)",
             CLIENT_SECRET_ENV,
+            profile,
         );
     }
     let tr: TokenResponse = resp.json().await.context("parsing exchange response")?;
@@ -1338,7 +1515,7 @@ pub async fn audience_access_token(
         scope: tr.scope,
     };
     let bearer = stored.access_token.clone();
-    cache().await.lock().await.insert(audience.to_string(), stored);
+    cache().await.lock().await.insert(cache_key, stored);
     Ok(Some(bearer))
 }
 "##;
@@ -1351,7 +1528,7 @@ fn emit_readme(ir: &Ir, bin_name: &str, oauth: Option<&OauthInfo>) -> String {
     let prefix = env_prefix(bin_name);
     let oauth_section = if let Some(oa) = oauth {
         let mut s = format!(
-            "\n## OAuth\n\nThis CLI was generated with OAuth 2.0 (PKCE authorization-code) wired up.\n\n```sh\n{bin_name} login    # opens a browser, persists the access token\n{bin_name} logout   # deletes the stored token\n```\n\nThe token is stored at the platform config dir under `{bin_name}/auth.json` (mode 0600 on Unix).\nThe token is refreshed lazily on a 30-second skew.\n\n### Targeting a different IdP host\n\nThe authorization and token URLs from the spec are baked in as defaults. Override at runtime to point at a different environment's Keycloak / IdP:\n\n```sh\nexport {prefix}_AUTH_URL=https://auth.dev.example.com/realms/<realm>/protocol/openid-connect/auth\nexport {prefix}_TOKEN_URL=https://auth.dev.example.com/realms/<realm>/protocol/openid-connect/token\n```\n\nBoth env vars must be set together; an empty value falls back to the spec default.\n"
+            "\n## OAuth\n\nThis CLI was generated with OAuth 2.0 (PKCE authorization-code) wired up.\n\n```sh\n{bin_name} login    # opens a browser, persists the access token\n{bin_name} logout   # deletes the stored token\n```\n\nThe token is stored at the platform config dir under `{bin_name}/profiles/<profile>/auth.json` (mode 0600 on Unix).\nThe token is refreshed lazily on a 30-second skew.\n\n## Profiles (AWS-style)\n\nThe CLI bundles deployment-specific settings (URLs, client ID/secret) under named profiles in `<config_dir>/{bin_name}/config.toml`. The `default` profile is auto-populated from the spec on first run.\n\n```sh\n{bin_name} --profile dev <op>          # one-off override\n{prefix}_PROFILE=dev {bin_name} <op>    # via env\n```\n\nProfile fields are: `base_url`, `auth_url`, `token_url`, `client_id`, `client_secret`. Hand-edit `config.toml` for now (`{bin_name} configure` lands in a follow-up). Resolution chain per setting: `--<flag>` → `{prefix}_<NAME>` env → profile field → spec default.\n\nClient-secret resolution: per-profile literal `client_secret = \"...\"` → `{prefix}_CLIENT_SECRET` env (or the env var named in the generator's `oauth.clientSecretEnv`) → none. Storing the secret literally in `config.toml` matches the security posture of `~/.aws/credentials` (mode 0600 on Unix).\n\n### Targeting a different IdP host\n\n```sh\nexport {prefix}_AUTH_URL=https://auth.dev.example.com/realms/<realm>/protocol/openid-connect/auth\nexport {prefix}_TOKEN_URL=https://auth.dev.example.com/realms/<realm>/protocol/openid-connect/token\n```\n\nOr, more durably, edit the relevant profile in `config.toml`.\n"
         );
         if let Some(env) = oa.config.client_secret_env.as_deref().filter(|s| !s.is_empty()) {
             s.push_str(&format!(
@@ -1361,7 +1538,7 @@ fn emit_readme(ir: &Ir, bin_name: &str, oauth: Option<&OauthInfo>) -> String {
         if let Some(ex) = &oa.exchange {
             let kebab = kebab_case(&ex.placeholder);
             s.push_str(&format!(
-                "\n## Per-`{kebab}` token exchange (RFC 8693)\n\nOperations whose path includes `{{{ph}}}` use a tenant-scoped JWT minted via standard RFC 8693 token exchange against the IdP's token endpoint.\n\n```sh\n{bin_name} --{kebab} <slug> <op>           # one-off\n{bin_name} set-{kebab} <slug>                # persist a default\n{bin_name} unset-{kebab}                     # clear it\n{bin_name} show-{kebab}                      # show the current default\n```\n",
+                "\n## Per-`{kebab}` token exchange (RFC 8693)\n\nOperations whose path includes `{{{ph}}}` use a tenant-scoped JWT minted via standard RFC 8693 token exchange against the IdP's token endpoint.\n\n```sh\n{bin_name} --{kebab} <slug> <op>           # one-off\n{bin_name} set-{kebab} <slug>                # persist a default (per active profile)\n{bin_name} unset-{kebab}                     # clear it (per active profile)\n{bin_name} show-{kebab}                      # show the current default\n```\n\n`set-{kebab}` writes to `<config_dir>/{bin_name}/profiles/<active>/{kebab}.json` — different profiles keep separate defaults.\n",
                 ph = ex.placeholder,
             ));
         }
