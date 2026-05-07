@@ -212,6 +212,7 @@ rand = "0.8"
 webbrowser = "1"
 directories = "6"
 toml = "0.8"
+dialoguer = "0.11"
 "#
     } else {
         ""
@@ -315,9 +316,9 @@ fn emit_main_rs(ir: &Ir, cfg: &Config, bin_name: &str, oauth: Option<&OauthInfo>
         out.push_str("    auth::migrate_legacy()?;\n    auth::bootstrap_default_profile_if_missing()?;\n");
     }
 
-    // Built-in handlers for login / logout / placeholder-config subcommands.
+    // Built-in handlers for login / logout / configure / profile / placeholder-config.
     if oauth_active {
-        out.push_str("    if matches!(cli.cmd, Cmd::Login) {\n        auth::login(&cli.profile).await?;\n        eprintln!(\"logged in (profile: {})\", cli.profile);\n        return Ok(());\n    }\n    if matches!(cli.cmd, Cmd::Logout) {\n        let removed = auth::logout(&cli.profile).await?;\n        eprintln!(\"{}\", if removed { \"logged out\" } else { \"no stored token\" });\n        return Ok(());\n    }\n");
+        out.push_str("    if matches!(cli.cmd, Cmd::Login) {\n        auth::login(&cli.profile).await?;\n        eprintln!(\"logged in (profile: {})\", cli.profile);\n        return Ok(());\n    }\n    if matches!(cli.cmd, Cmd::Logout) {\n        let removed = auth::logout(&cli.profile).await?;\n        eprintln!(\"{}\", if removed { \"logged out\" } else { \"no stored token\" });\n        return Ok(());\n    }\n    if matches!(cli.cmd, Cmd::Configure) {\n        let should_login = auth::interactive_configure(&cli.profile)?;\n        if should_login {\n            auth::login(&cli.profile).await?;\n            eprintln!(\"logged in (profile: {})\", cli.profile);\n        }\n        return Ok(());\n    }\n    if let Cmd::Profile(args) = &cli.cmd {\n        match &args.cmd {\n            ProfileCmd::List => {\n                for name in auth::list_profile_names() {\n                    println!(\"{}\", name);\n                }\n                return Ok(());\n            }\n            ProfileCmd::Show { name } => {\n                let p = name.as_deref().unwrap_or(cli.profile.as_str());\n                auth::show_profile(p)?;\n                return Ok(());\n            }\n            ProfileCmd::Remove { name } => {\n                let removed = auth::remove_profile(name)?;\n                eprintln!(\"{}\", if removed { \"removed\" } else { \"not found\" });\n                return Ok(());\n            }\n        }\n    }\n");
     }
     if let Some(pascal) = &placeholder_pascal {
         let kebab = placeholder_kebab.as_ref().unwrap();
@@ -342,7 +343,7 @@ fn emit_main_rs(ir: &Ir, cfg: &Config, bin_name: &str, oauth: Option<&OauthInfo>
     out.push_str("    let result: serde_json::Value = match cli.cmd {\n");
     out.push_str("        Cmd::Completion { .. } => unreachable!(\"handled above\"),\n");
     if oauth_active {
-        out.push_str("        Cmd::Login | Cmd::Logout => unreachable!(\"handled above\"),\n");
+        out.push_str("        Cmd::Login | Cmd::Logout | Cmd::Configure | Cmd::Profile(_) => unreachable!(\"handled above\"),\n");
     }
     if placeholder_pascal.is_some() {
         let pascal = placeholder_pascal.as_ref().unwrap();
@@ -373,7 +374,7 @@ fn emit_root_enum(
     out.push_str("#[derive(Subcommand)]\nenum Cmd {\n");
     out.push_str("    /// Print a shell completion script. e.g. `source <(<bin> completion bash)`.\n    Completion {\n        /// Target shell.\n        #[arg(value_enum)]\n        shell: clap_complete::Shell,\n    },\n");
     if oauth_active {
-        out.push_str("    /// Run OAuth 2.0 authorization-code flow with PKCE; persists the access token.\n    Login,\n    /// Delete the stored OAuth token.\n    Logout,\n");
+        out.push_str("    /// Run OAuth 2.0 authorization-code flow with PKCE; persists the access token.\n    Login,\n    /// Delete the stored OAuth token.\n    Logout,\n    /// Interactively create or edit the active profile (use `--profile` to pick).\n    Configure,\n    /// List, inspect, or delete profiles.\n    Profile(ProfileArgs),\n");
     }
     if exchange.is_some() {
         let pascal = placeholder_pascal.unwrap();
@@ -395,6 +396,10 @@ fn emit_root_enum(
         }
     }
     out.push_str("}\n\n");
+
+    if oauth_active {
+        out.push_str("#[derive(Args)]\npub struct ProfileArgs {\n    #[command(subcommand)]\n    cmd: ProfileCmd,\n}\n\n#[derive(Subcommand)]\npub enum ProfileCmd {\n    /// List configured profile names from config.toml.\n    List,\n    /// Print the resolved settings for a profile (secret redacted).\n    Show {\n        /// Profile name; defaults to the global --profile value.\n        name: Option<String>,\n    },\n    /// Delete a profile from config.toml and remove its on-disk dir.\n    Remove {\n        /// Profile name (required to avoid accidental deletion).\n        name: String,\n    },\n}\n\n");
+    }
 }
 
 fn emit_group_types(out: &mut String, group: &TagGroup, prefix: &str, exchange: Option<&TokenExchangeInfo>) {
@@ -1425,6 +1430,105 @@ pub fn list_profile_names() -> Vec<String> {
     read_config()
         .map(|cfg| cfg.profiles.keys().cloned().collect())
         .unwrap_or_default()
+}
+
+/// Interactive `<bin> configure` flow. Prompts for the profile's
+/// fields with sensible defaults (current value or spec default),
+/// writes back to config.toml, and returns whether the operator
+/// asked to log in immediately.
+pub fn interactive_configure(profile: &str) -> Result<bool> {
+    use dialoguer::theme::ColorfulTheme;
+    use dialoguer::{Confirm, Input, Password};
+
+    let theme = ColorfulTheme::default();
+    eprintln!("Configuring profile: {}", profile);
+
+    let mut cfg = read_config()?;
+    let current = cfg.profiles.get(profile).cloned().unwrap_or_default();
+
+    let base_url: String = Input::with_theme(&theme)
+        .with_prompt("Base URL")
+        .default(current.base_url.clone().unwrap_or_else(|| BASE_URL_DEFAULT.into()))
+        .interact_text()?;
+    let auth_url: String = Input::with_theme(&theme)
+        .with_prompt("Authorization URL")
+        .default(current.auth_url.clone().unwrap_or_else(|| AUTH_URL_DEFAULT.into()))
+        .interact_text()?;
+    let token_url: String = Input::with_theme(&theme)
+        .with_prompt("Token URL")
+        .default(current.token_url.clone().unwrap_or_else(|| TOKEN_URL_DEFAULT.into()))
+        .interact_text()?;
+    let client_id: String = Input::with_theme(&theme)
+        .with_prompt("Client ID")
+        .default(current.client_id.clone().unwrap_or_else(|| CLIENT_ID_DEFAULT.into()))
+        .interact_text()?;
+
+    let store_secret = Confirm::with_theme(&theme)
+        .with_prompt(format!(
+            "Store the client secret in config.toml? (No → use the {} env var instead)",
+            if CLIENT_SECRET_ENV.is_empty() { "PREFIX_CLIENT_SECRET" } else { CLIENT_SECRET_ENV }
+        ))
+        .default(current.client_secret.is_some())
+        .interact()?;
+    let client_secret = if store_secret {
+        let s: String = Password::with_theme(&theme)
+            .with_prompt("Client secret")
+            .interact()?;
+        if s.is_empty() { None } else { Some(s) }
+    } else {
+        if !CLIENT_SECRET_ENV.is_empty() {
+            eprintln!("(remember to `export {}=...` in your shell)", CLIENT_SECRET_ENV);
+        }
+        None
+    };
+
+    cfg.profiles.insert(
+        profile.to_string(),
+        Profile {
+            base_url: Some(base_url),
+            auth_url: Some(auth_url),
+            token_url: Some(token_url),
+            client_id: Some(client_id),
+            client_secret,
+        },
+    );
+    write_config(&cfg)?;
+    eprintln!("Wrote profile '{}' to config.toml.", profile);
+
+    let should_login = Confirm::with_theme(&theme)
+        .with_prompt("Run login now?")
+        .default(true)
+        .interact()?;
+    Ok(should_login)
+}
+
+pub fn show_profile(profile: &str) -> Result<()> {
+    let cfg = read_config()?;
+    let Some(p) = cfg.profiles.get(profile) else {
+        eprintln!("profile '{}' not found", profile);
+        std::process::exit(2);
+    };
+    let mut redacted = p.clone();
+    if redacted.client_secret.as_deref().is_some_and(|s| !s.is_empty()) {
+        redacted.client_secret = Some("***".into());
+    }
+    let s = toml::to_string_pretty(&redacted).unwrap_or_default();
+    println!("[profiles.{}]", profile);
+    print!("{}", s);
+    Ok(())
+}
+
+pub fn remove_profile(profile: &str) -> Result<bool> {
+    let mut cfg = read_config()?;
+    let removed = cfg.profiles.remove(profile).is_some();
+    if removed {
+        write_config(&cfg)?;
+        let dir = profile_dir(profile)?;
+        if dir.exists() {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+    Ok(removed)
 }
 "##;
 
