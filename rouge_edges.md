@@ -17,12 +17,3 @@ workaround, and a one-line idea for an upstream fix.
   the plugin-authoring docs should lead with those constructors before
   showing struct-literal usage.
 
-## Distribution / OCI
-
-- **GHCR user-owned packages default to private even when the source repo
-  is public.** First publish leaves the artifact unpullable by `forge`'s
-  anonymous OCI client (ADR-0010). There is no REST API to flip
-  visibility for user-owned packages — only the web UI at
-  `https://github.com/users/<owner>/packages/container/<name>/settings`.
-  Fix: document this gotcha in `docs/plugin-authoring.md` under
-  "Distributing your plugin", with the direct settings URL.
