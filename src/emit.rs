@@ -14,6 +14,7 @@ use forge_plugin_sdk::{values_ext, GenerationOutput, OutputFile};
 
 use crate::config::{Config, OAuthConfig};
 use crate::naming::{kebab_case, pascal_case, screaming_snake, snake_case};
+use crate::schema;
 use crate::tags::{self, TagGroup, TagTree};
 
 pub fn all(ir: &Ir, cfg: &Config) -> GenerationOutput {
@@ -265,6 +266,8 @@ fn emit_main_rs(ir: &Ir, cfg: &Config, bin_name: &str, oauth: Option<&OauthInfo>
     }
     out.push_str("mod client;\nmod runtime;\n\nuse clap::{Args, CommandFactory, Parser, Subcommand};\nuse client::ApiClient;\nuse runtime::OutputMode;\n\n");
 
+    out.push_str(&emit_schema_consts(ir));
+
     let base_url_decl = if oauth_active {
         format!(
             "    /// API base URL. When unset, falls back to the active profile, then the spec default.\n    #[arg(long, global = true, env = \"{prefix}_BASE_URL\")]\n    base_url: Option<String>,\n\n"
@@ -281,8 +284,16 @@ fn emit_main_rs(ir: &Ir, cfg: &Config, bin_name: &str, oauth: Option<&OauthInfo>
     } else {
         String::new()
     };
+    let long_about = build_long_about(
+        &ir.info.title,
+        bin_name,
+        &prefix,
+        oauth_active,
+        placeholder_kebab.as_deref(),
+    );
+    let long_about_lit = json_string(&long_about);
     out.push_str(&format!(
-        "#[derive(Parser)]\n#[command(name = \"{bin_name}\", version = \"{version}\", about = \"{title}\", long_about = None)]\nstruct Cli {{\n{base_url_decl}    /// Bearer token. Overrides any stored OAuth or exchanged token.\n    #[arg(long, global = true, env = \"{prefix}_TOKEN\")]\n    token: Option<String>,\n\n    /// Output mode for response bodies.\n    #[arg(long, global = true, value_enum, default_value_t = OutputMode::Json)]\n    output: OutputMode,\n\n{profile_decl}"
+        "#[derive(Parser)]\n#[command(name = \"{bin_name}\", version = \"{version}\", about = \"{title}\", long_about = {long_about_lit})]\nstruct Cli {{\n{base_url_decl}    /// Bearer token. Overrides any stored OAuth or exchanged token.\n    #[arg(long, global = true, env = \"{prefix}_TOKEN\")]\n    token: Option<String>,\n\n    /// Output mode for response bodies.\n    #[arg(long, global = true, value_enum, default_value_t = OutputMode::Json)]\n    output: OutputMode,\n\n{profile_decl}"
     ));
 
     if let (Some(kebab), Some(snake)) = (&placeholder_kebab, &placeholder_snake) {
@@ -406,7 +417,7 @@ fn emit_root_enum(
     out.push_str("}\n\n");
 
     if oauth_active {
-        out.push_str("#[derive(Args)]\npub struct ProfileArgs {\n    #[command(subcommand)]\n    cmd: ProfileCmd,\n}\n\n#[derive(Subcommand)]\npub enum ProfileCmd {\n    /// List configured profile names from config.toml.\n    List,\n    /// Print the resolved settings for a profile (secret redacted).\n    Show {\n        /// Profile name; defaults to the global --profile value.\n        name: Option<String>,\n    },\n    /// Delete a profile from config.toml and remove its on-disk dir.\n    Remove {\n        /// Profile name (required to avoid accidental deletion).\n        name: String,\n    },\n}\n\n");
+        out.push_str("#[derive(Args)]\npub struct ProfileArgs {\n    #[command(subcommand)]\n    cmd: ProfileCmd,\n}\n\n#[derive(Subcommand)]\npub enum ProfileCmd {\n    /// List configured profile names from config.toml.\n    List,\n    /// Print the resolved settings for a profile (secret redacted).\n    Show {\n        /// Profile name; defaults to the global --profile value.\n        #[arg(add = clap_complete::ArgValueCandidates::new(__complete_profile_names))]\n        name: Option<String>,\n    },\n    /// Delete a profile from config.toml and remove its on-disk dir.\n    Remove {\n        /// Profile name (required to avoid accidental deletion).\n        #[arg(add = clap_complete::ArgValueCandidates::new(__complete_profile_names))]\n        name: String,\n    },\n}\n\n");
     }
 }
 
@@ -552,8 +563,25 @@ fn render_op_match_arm(
     for p in &op.query_params { call_args.push(snake_case(&p.name)); }
     for p in &op.header_params { call_args.push(snake_case(&p.name)); }
     for p in &op.cookie_params { call_args.push(snake_case(&p.name)); }
-    if op.request_body.is_some() { call_args.push("body".into()); }
+    if let Some(b) = &op.request_body {
+        if b.required {
+            // clap's `required_unless_present = "body_schema"` guarantees
+            // `body` is `Some` whenever we reach the API call branch.
+            call_args.push("body.expect(\"--body required\")".into());
+        } else {
+            call_args.push("body".into());
+        }
+    }
     let call = format!("client.{method_ident}({}).await?", call_args.join(", "));
+
+    let has_body = op.request_body.is_some();
+    let has_resp_schema = op_has_response_content(op);
+    let any_guard = has_body || has_resp_schema;
+    let inner_indent = if any_guard {
+        format!("{indent}        ")
+    } else {
+        format!("{indent}    ")
+    };
 
     let pre_block = if needs_exchange {
         let ex = exchange.unwrap();
@@ -561,7 +589,7 @@ fn render_op_match_arm(
         let ph_kebab = kebab_case(&ex.placeholder);
         format!(
             "let __slug: String = __resolved_{ph_snake}.clone().ok_or_else(|| \
-                anyhow::anyhow!(\"--{ph_kebab} is required for this operation (or run `set-{ph_kebab} <slug>`)\"))?;\n{indent}    "
+                anyhow::anyhow!(\"--{ph_kebab} is required for this operation (or run `set-{ph_kebab} <slug>`)\"))?;\n{inner_indent}"
         )
     } else {
         String::new()
@@ -596,8 +624,31 @@ fn render_op_match_arm(
         "cli.token.clone()".into()
     };
 
+    let const_pascal = screaming_snake(&op.id);
+    let api_path = format!(
+        "{pre_block}let __bearer: Option<String> = {bearer_block};\n{inner_indent}{call}"
+    );
+
+    let mut guards = String::new();
+    if has_body {
+        guards.push_str(&format!(
+            "if body_schema {{\n{indent}        println!(\"{{}}\", BODY_SCHEMA_{const_pascal});\n{indent}        serde_json::Value::Null\n{indent}    }} else "
+        ));
+    }
+    if has_resp_schema {
+        guards.push_str(&format!(
+            "if response_schema {{\n{indent}        println!(\"{{}}\", RESPONSE_SCHEMA_{const_pascal});\n{indent}        serde_json::Value::Null\n{indent}    }} else "
+        ));
+    }
+
+    let arm_body = if any_guard {
+        format!("{guards}{{\n{indent}        {api_path}\n{indent}    }}")
+    } else {
+        api_path
+    };
+
     format!(
-        "{indent}{cmd_ty}::{variant}{destruct_pat} => {{\n{indent}    {pre_block}let __bearer: Option<String> = {bearer_block};\n{indent}    {call}\n{indent}}},\n",
+        "{indent}{cmd_ty}::{variant}{destruct_pat} => {{\n{indent}    {arm_body}\n{indent}}},\n",
     )
 }
 
@@ -626,8 +677,13 @@ fn collect_fields(op: &Operation, exclude_path_param: Option<&str>) -> Vec<Field
     for p in &op.cookie_params {
         out.push(field_for_param(p, FieldKind::Flag));
     }
+    let has_resp = op_has_response_content(op);
     if let Some(body) = &op.request_body {
-        out.push(field_for_body(body));
+        out.push(field_for_body(body, has_resp));
+        out.push(field_for_body_schema());
+    }
+    if has_resp {
+        out.push(field_for_response_schema());
     }
     out
 }
@@ -655,14 +711,147 @@ fn field_for_param(p: &Parameter, kind: FieldKind) -> Field {
     Field { ident, ty, doc, attrs }
 }
 
-fn field_for_body(body: &Body) -> Field {
-    let ty = if body.required { "String" } else { "Option<String>" };
+fn field_for_body(body: &Body, has_response_schema: bool) -> Field {
+    let attrs = if body.required {
+        let unless = if has_response_schema {
+            "required_unless_present_any = [\"body_schema\", \"response_schema\"]"
+        } else {
+            "required_unless_present = \"body_schema\""
+        };
+        vec![format!("#[arg(long = \"body\", {unless})]")]
+    } else {
+        vec!["#[arg(long = \"body\")]".into()]
+    };
     Field {
         ident: "body".into(),
-        ty: ty.into(),
-        doc: Some("Request body: inline JSON, @file.json, or - for stdin.".into()),
-        attrs: vec!["#[arg(long = \"body\")]".into()],
+        ty: "Option<String>".into(),
+        doc: Some(
+            "Request body. Inline JSON, @file.json (read from file), or - (read from stdin). \
+             Run with --body-schema to print the JSON Schema."
+                .into(),
+        ),
+        attrs,
     }
+}
+
+fn field_for_body_schema() -> Field {
+    Field {
+        ident: "body_schema".into(),
+        ty: "bool".into(),
+        doc: Some("Print the JSON Schema for the request body and exit.".into()),
+        attrs: vec!["#[arg(long = \"body-schema\")]".into()],
+    }
+}
+
+fn field_for_response_schema() -> Field {
+    Field {
+        ident: "response_schema".into(),
+        ty: "bool".into(),
+        doc: Some(
+            "Print the JSON Schemas for the response bodies, keyed by status code, and exit."
+                .into(),
+        ),
+        attrs: vec!["#[arg(long = \"response-schema\")]".into()],
+    }
+}
+
+fn op_has_response_content(op: &Operation) -> bool {
+    op.responses.iter().any(|r| !r.content.is_empty())
+}
+
+fn build_long_about(
+    title: &str,
+    bin_name: &str,
+    prefix: &str,
+    oauth_active: bool,
+    exchange_placeholder_kebab: Option<&str>,
+) -> String {
+    let mut s = String::new();
+    if !title.trim().is_empty() {
+        s.push_str(title.trim());
+        s.push_str("\n\n");
+    }
+    s.push_str(&format!(
+        "Generated from an OpenAPI specification — each subcommand maps to one operation. \
+         Run `{bin_name} help <command>` (or `<command> --help`) for per-operation flags.\n\n"
+    ));
+
+    s.push_str("Discover request and response shapes (no network call):\n");
+    s.push_str(&format!(
+        "  {bin_name} <op> --body-schema       JSON Schema for the request body.\n"
+    ));
+    s.push_str(&format!(
+        "  {bin_name} <op> --response-schema   JSON Schemas for response bodies, keyed by status code.\n"
+    ));
+    s.push_str("Bodies accept inline JSON, @file.json (read from file), or `-` (read from stdin).\n\n");
+
+    if oauth_active {
+        s.push_str("Authentication and profiles:\n");
+        s.push_str(&format!(
+            "  {bin_name} login | logout         OAuth 2.0 authorization-code (PKCE); persists the access token.\n"
+        ));
+        s.push_str(&format!(
+            "  {bin_name} configure              Edit the active profile (base_url, auth_url, client_id, ...).\n"
+        ));
+        s.push_str(&format!(
+            "  {bin_name} profile <subcmd>       list | show | remove configured profiles.\n"
+        ));
+        s.push_str(
+            "  --profile <name>                  Switch between configured profiles (default: \"default\").\n",
+        );
+        s.push_str("  --token <jwt>                     Override the stored token for one call.\n\n");
+    }
+
+    if let Some(ph) = exchange_placeholder_kebab {
+        s.push_str("Multi-tenant operations:\n");
+        s.push_str(&format!(
+            "  Operations whose path includes `{{{ph}}}` mint a tenant-audienced JWT via RFC 8693 token exchange.\n"
+        ));
+        s.push_str(&format!(
+            "  Pass `--{ph} <slug>` per call, or run `{bin_name} set-{ph} <slug>` to persist a default.\n\n"
+        ));
+    }
+
+    s.push_str(&format!(
+        "Shell completions: `{bin_name} completion <shell>` (bash | zsh | fish | powershell | elvish).\n"
+    ));
+    s.push_str(&format!(
+        "Environment overrides: `{prefix}_BASE_URL`, `{prefix}_TOKEN`"
+    ));
+    if oauth_active {
+        s.push_str(&format!(", `{prefix}_PROFILE`"));
+    }
+    s.push_str(", and per-flag env vars listed in each subcommand's help.");
+
+    s
+}
+
+fn emit_schema_consts(ir: &Ir) -> String {
+    let mut out = String::new();
+    for op in &ir.operations {
+        let pascal = screaming_snake(&op.id);
+        if let Some(body) = &op.request_body {
+            if let Some(s) = schema::render_body_schema(&ir.types, &ir.values, body) {
+                out.push_str(&format!(
+                    "const BODY_SCHEMA_{pascal}: &str = {};\n",
+                    json_string(&s),
+                ));
+            }
+        }
+        if op_has_response_content(op) {
+            if let Some(s) = schema::render_response_schemas(&ir.types, &ir.values, &op.responses)
+            {
+                out.push_str(&format!(
+                    "const RESPONSE_SCHEMA_{pascal}: &str = {};\n",
+                    json_string(&s),
+                ));
+            }
+        }
+    }
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out
 }
 
 fn group_doc(group: &TagGroup) -> Option<String> {
