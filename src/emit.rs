@@ -326,7 +326,7 @@ fn emit_main_rs(ir: &Ir, cfg: &Config, bin_name: &str, oauth: Option<&OauthInfo>
 
     // Built-in handlers for login / logout / configure / profile / placeholder-config.
     if oauth_active {
-        out.push_str("    if matches!(cli.cmd, Cmd::Login) {\n        auth::login(&cli.profile).await?;\n        eprintln!(\"logged in (profile: {})\", cli.profile);\n        return Ok(());\n    }\n    if matches!(cli.cmd, Cmd::Logout) {\n        let removed = auth::logout(&cli.profile).await?;\n        eprintln!(\"{}\", if removed { \"logged out\" } else { \"no stored token\" });\n        return Ok(());\n    }\n    if matches!(cli.cmd, Cmd::Configure) {\n        let should_login = auth::interactive_configure(&cli.profile)?;\n        if should_login {\n            auth::login(&cli.profile).await?;\n            eprintln!(\"logged in (profile: {})\", cli.profile);\n        }\n        return Ok(());\n    }\n    if let Cmd::Profile(args) = &cli.cmd {\n        match &args.cmd {\n            ProfileCmd::List => {\n                for name in auth::list_profile_names() {\n                    println!(\"{}\", name);\n                }\n                return Ok(());\n            }\n            ProfileCmd::Show { name } => {\n                let p = name.as_deref().unwrap_or(cli.profile.as_str());\n                auth::show_profile(p)?;\n                return Ok(());\n            }\n            ProfileCmd::Remove { name } => {\n                let removed = auth::remove_profile(name)?;\n                eprintln!(\"{}\", if removed { \"removed\" } else { \"not found\" });\n                return Ok(());\n            }\n        }\n    }\n");
+        out.push_str("    if matches!(cli.cmd, Cmd::Login) {\n        auth::login(&cli.profile).await?;\n        eprintln!(\"logged in (profile: {})\", cli.profile);\n        return Ok(());\n    }\n    if matches!(cli.cmd, Cmd::Logout) {\n        let removed = auth::logout(&cli.profile).await?;\n        eprintln!(\"{}\", if removed { \"logged out\" } else { \"no stored token\" });\n        return Ok(());\n    }\n    if let Cmd::Configure { base_url, auth_url, token_url, client_id, client_secret, non_interactive } = &cli.cmd {\n        let any_field = base_url.is_some() || auth_url.is_some() || token_url.is_some() || client_id.is_some() || client_secret.is_some();\n        if *non_interactive || any_field {\n            auth::write_profile_fields(\n                &cli.profile,\n                base_url.clone(),\n                auth_url.clone(),\n                token_url.clone(),\n                client_id.clone(),\n                client_secret.clone(),\n            )?;\n        } else {\n            let should_login = auth::interactive_configure(&cli.profile)?;\n            if should_login {\n                auth::login(&cli.profile).await?;\n                eprintln!(\"logged in (profile: {})\", cli.profile);\n            }\n        }\n        return Ok(());\n    }\n    if let Cmd::Profile(args) = &cli.cmd {\n        match &args.cmd {\n            ProfileCmd::List => {\n                for name in auth::list_profile_names() {\n                    println!(\"{}\", name);\n                }\n                return Ok(());\n            }\n            ProfileCmd::Show { name } => {\n                let p = name.as_deref().unwrap_or(cli.profile.as_str());\n                auth::show_profile(p)?;\n                return Ok(());\n            }\n            ProfileCmd::Remove { name } => {\n                let removed = auth::remove_profile(name)?;\n                eprintln!(\"{}\", if removed { \"removed\" } else { \"not found\" });\n                return Ok(());\n            }\n        }\n    }\n");
     }
     if let Some(pascal) = &placeholder_pascal {
         let kebab = placeholder_kebab.as_ref().unwrap();
@@ -351,7 +351,7 @@ fn emit_main_rs(ir: &Ir, cfg: &Config, bin_name: &str, oauth: Option<&OauthInfo>
     out.push_str("    let result: serde_json::Value = match cli.cmd {\n");
     out.push_str("        Cmd::Completion { .. } => unreachable!(\"handled above\"),\n");
     if oauth_active {
-        out.push_str("        Cmd::Login | Cmd::Logout | Cmd::Configure | Cmd::Profile(_) => unreachable!(\"handled above\"),\n");
+        out.push_str("        Cmd::Login | Cmd::Logout | Cmd::Configure { .. } | Cmd::Profile(_) => unreachable!(\"handled above\"),\n");
     }
     if placeholder_pascal.is_some() {
         let pascal = placeholder_pascal.as_ref().unwrap();
@@ -382,7 +382,7 @@ fn emit_root_enum(
     out.push_str("#[derive(Subcommand)]\nenum Cmd {\n");
     out.push_str("    /// Print a shell completion script. e.g. `source <(<bin> completion bash)`.\n    Completion {\n        /// Target shell.\n        #[arg(value_enum)]\n        shell: clap_complete::Shell,\n    },\n");
     if oauth_active {
-        out.push_str("    /// Run OAuth 2.0 authorization-code flow with PKCE; persists the access token.\n    Login,\n    /// Delete the stored OAuth token.\n    Logout,\n    /// Interactively create or edit the active profile (use `--profile` to pick).\n    Configure,\n    /// List, inspect, or delete profiles.\n    Profile(ProfileArgs),\n");
+        out.push_str("    /// Run OAuth 2.0 authorization-code flow with PKCE; persists the access token.\n    Login,\n    /// Delete the stored OAuth token.\n    Logout,\n    /// Create or edit the active profile (use `--profile` to pick). With no flags, prompts interactively; with `--non-interactive` (or any field flag), writes without prompting.\n    Configure {\n        /// Set base_url non-interactively.\n        #[arg(long)]\n        base_url: Option<String>,\n        /// Set auth_url non-interactively.\n        #[arg(long)]\n        auth_url: Option<String>,\n        /// Set token_url non-interactively.\n        #[arg(long)]\n        token_url: Option<String>,\n        /// Set client_id non-interactively.\n        #[arg(long)]\n        client_id: Option<String>,\n        /// Set client_secret non-interactively. Stored in `config.toml` (mode 0600). Prefer setting via the env var when possible.\n        #[arg(long)]\n        client_secret: Option<String>,\n        /// Skip all prompts. Fields not given as flags keep their existing value.\n        #[arg(long)]\n        non_interactive: bool,\n    },\n    /// List, inspect, or delete profiles.\n    Profile(ProfileArgs),\n");
     }
     if exchange.is_some() {
         let pascal = placeholder_pascal.unwrap();
@@ -1510,6 +1510,30 @@ pub fn interactive_configure(profile: &str) -> Result<bool> {
     Ok(should_login)
 }
 
+/// Non-interactive `<bin> configure --non-interactive` flow. Merges
+/// the supplied fields into the named profile, leaving fields whose
+/// argument is `None` untouched. Used by installer scripts and other
+/// automation. Mirrors `interactive_configure` write semantics.
+pub fn write_profile_fields(
+    profile: &str,
+    base_url: Option<String>,
+    auth_url: Option<String>,
+    token_url: Option<String>,
+    client_id: Option<String>,
+    client_secret: Option<String>,
+) -> Result<()> {
+    let mut cfg = read_config()?;
+    let entry = cfg.profiles.entry(profile.to_string()).or_default();
+    if base_url.is_some() { entry.base_url = base_url; }
+    if auth_url.is_some() { entry.auth_url = auth_url; }
+    if token_url.is_some() { entry.token_url = token_url; }
+    if client_id.is_some() { entry.client_id = client_id; }
+    if client_secret.is_some() { entry.client_secret = client_secret; }
+    write_config(&cfg)?;
+    eprintln!("Wrote profile '{}' to config.toml.", profile);
+    Ok(())
+}
+
 pub fn show_profile(profile: &str) -> Result<()> {
     let cfg = read_config()?;
     let Some(p) = cfg.profiles.get(profile) else {
@@ -1701,5 +1725,39 @@ mod tests {
         assert_eq!(extract_placeholders("urn:x:tenant:{tenant}"), vec!["tenant"]);
         assert_eq!(extract_placeholders("https://api/{a}/{b}/items"), vec!["a", "b"]);
         assert_eq!(extract_placeholders("static"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn auth_prologue_includes_write_profile_fields() {
+        // Non-interactive configure flow depends on this helper being emitted.
+        assert!(
+            AUTH_RS_PROLOGUE.contains("pub fn write_profile_fields("),
+            "auth.rs prologue must define write_profile_fields"
+        );
+        assert!(
+            AUTH_RS_PROLOGUE.contains("client_secret: Option<String>,"),
+            "write_profile_fields must accept Option<String> for each field"
+        );
+    }
+
+    #[test]
+    fn configure_variant_exposes_non_interactive_flags() {
+        // Empty tag tree is enough to drive emit_root_enum into the oauth branch.
+        let tree = TagTree { roots: vec![] };
+        let mut out = String::new();
+        emit_root_enum(&mut out, &tree, /*oauth_active*/ true, None, None, None);
+
+        // Struct-form Configure with each scriptable field + the bypass flag.
+        for needle in [
+            "Configure {",
+            "base_url: Option<String>",
+            "auth_url: Option<String>",
+            "token_url: Option<String>",
+            "client_id: Option<String>",
+            "client_secret: Option<String>",
+            "non_interactive: bool",
+        ] {
+            assert!(out.contains(needle), "emitted Cmd enum missing `{needle}`:\n{out}");
+        }
     }
 }
