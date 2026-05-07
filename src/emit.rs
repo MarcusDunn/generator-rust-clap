@@ -230,7 +230,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap = {{ version = "4", features = ["derive", "env"] }}
-clap_complete = "4"
+clap_complete = {{ version = "4", features = ["unstable-dynamic"] }}
 tokio = {{ version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "sync"] }}
 serde = {{ version = "1", features = ["derive"] }}
 serde_json = "1"
@@ -276,7 +276,7 @@ fn emit_main_rs(ir: &Ir, cfg: &Config, bin_name: &str, oauth: Option<&OauthInfo>
     };
     let profile_decl = if oauth_active {
         format!(
-            "    /// Profile to use; bundles base_url / auth_url / token_url / client_id / client_secret. Default: \"default\".\n    #[arg(long, global = true, env = \"{prefix}_PROFILE\", default_value = \"default\")]\n    profile: String,\n\n"
+            "    /// Profile to use; bundles base_url / auth_url / token_url / client_id / client_secret. Default: \"default\".\n    #[arg(long, global = true, env = \"{prefix}_PROFILE\", default_value = \"default\", add = clap_complete::ArgValueCandidates::new(__complete_profile_names))]\n    profile: String,\n\n"
         )
     } else {
         String::new()
@@ -293,6 +293,10 @@ fn emit_main_rs(ir: &Ir, cfg: &Config, bin_name: &str, oauth: Option<&OauthInfo>
     }
 
     out.push_str("    #[command(subcommand)]\n    cmd: Cmd,\n}\n\n");
+
+    if oauth_active {
+        out.push_str("/// Dynamic-completion callback for the global `--profile` flag.\n/// Invoked at completion time by the shell; reads `config.toml` fresh.\nfn __complete_profile_names() -> Vec<clap_complete::CompletionCandidate> {\n    auth::list_profile_names()\n        .into_iter()\n        .map(clap_complete::CompletionCandidate::new)\n        .collect()\n}\n\n");
+    }
 
     if ir.operations.is_empty() && !oauth_active {
         out.push_str("#[derive(Subcommand)]\nenum Cmd {\n    /// (No operations declared in the spec.)\n    #[command(hide = true)]\n    Noop,\n}\n\n");
