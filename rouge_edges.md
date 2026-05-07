@@ -26,6 +26,36 @@ was awkward, the workaround, and a one-line idea for an upstream fix.
   the SDK README could lead with a one-line `nix develop -c cargo
   build --release --target wasm32-wasip2` recipe.
 
+- **`SecurityScheme.extensions` (and the rest of the IR's `x-*`
+  extension vecs) don't signpost the resolver.** The field is
+  `Vec<(String, ValueRef)>`; turning the `ValueRef` into something
+  walkable requires `forge_plugin_sdk::values_ext::resolve_to_serde`,
+  which I had to find by reading the SDK's `lib.rs`. Fix: the
+  rustdoc on every `extensions:` field could point at the resolver in
+  one line, e.g. `// Resolve via [`crate::values_ext::resolve_to_serde`].`
+
+- **No SDK helper for emitting source-tree-shaped output that's
+  syntax-checked at generator-author time.** The Rust auth runtime in
+  this plugin lives as a ~430-line `&str` template with
+  `__PLACEHOLDER__` substitutions; no rustfmt, no compile-check on
+  the template until the *generated* crate is built. A SDK pattern
+  for "emit this Rust crate as files, compile it as a sub-target of
+  the plugin's own build" would catch typos at the generator's CI
+  rather than the consumer's. Fix: at minimum, `forge` could
+  optionally `rustfmt` Rust outputs (heuristic: file ends in `.rs`)
+  before writing them — same idea as the prettier post-step in the
+  TS-fetch generator's `update-openapi-client.sh`.
+
+- **Plugin-authoring docs don't draw a line between "spec belongs"
+  and "plugin config belongs."** OAuth `clientId` lives in plugin
+  config (per-installation), `audience-template` lives in the spec
+  (contract), `clientSecretEnv` lives in plugin config but the actual
+  secret is runtime env. The boundary is judgment-y and each plugin
+  author redraws it. Fix: a short section in `plugin-authoring.md`
+  laying out the principle ("contract → spec; per-installation →
+  plugin config; per-operator → runtime env") with one or two
+  worked examples.
+
 ## CLI / pipeline
 
 - **`forge generate` config-less mode (`--input`/`--generator`/`-o`)
@@ -35,6 +65,18 @@ was awkward, the workaround, and a one-line idea for an upstream fix.
   three-line `forge.toml` and run `forge generate <dir>`. Fix: a
   `--generator-config <json>` flag (or `@file.json` / `-` for stdin)
   on config-less mode, mirroring the existing pattern.
+
+- **First-time OCI publish ergonomics aren't surfaced by
+  `plugin-authoring.md`.** Pushing the wasm to GHCR (or any registry
+  whose owner-default visibility is private) leaves the artifact
+  unpullable until the operator flips the package to public via the
+  web UI. `forge`'s OCI client is anonymous-only (ADR-0010), so a
+  consumer's first `forge generate` against a freshly-published
+  plugin will fail until that step. Fix: the "Distributing your
+  plugin" section in `docs/plugin-authoring.md` could call out the
+  visibility-flip step with a direct link to
+  `https://github.com/users/<owner>/packages/container/<name>/settings`
+  for GHCR, and an equivalent note for ECR/Docker Hub.
 
 ## Standards
 
@@ -62,3 +104,11 @@ was awkward, the workaround, and a one-line idea for an upstream fix.
   exchange) attaches `Authorization: Basic`. The secret is per-operator
   via env var, never embedded in the binary. This is the same posture
   `gcloud` / AWS CLI use for their internal-developer clients.
+
+- **OAS security schemes hold one auth/token URL pair.** Real APIs
+  deploy across dev/staging/prod with different IdP hostnames; the
+  spec describes the contract in one place. Workaround: the
+  generator emits `<PREFIX>_AUTH_URL` / `<PREFIX>_TOKEN_URL` runtime
+  env-var overrides on top of the spec values. Fix would be in OAS
+  itself (server-variable-style templating on flow URLs); not
+  something the SDK or `forge` can address downstream.
