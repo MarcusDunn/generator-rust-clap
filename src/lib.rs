@@ -14,7 +14,7 @@ use forge_plugin_sdk::generator::exports::forge::plugin::generator_api::{
 };
 use forge_plugin_sdk::generator::forge::plugin::stage::StageError;
 use forge_plugin_sdk::generator::forge::plugin::types::{Ir as WitIr, PluginInfo as WitPluginInfo};
-use forge_plugin_sdk::{ir, FileMode, GenerationOutput, OutputFile};
+use forge_plugin_sdk::{ir, GenerationOutput, OutputFile};
 
 #[derive(Debug, serde::Deserialize, Default)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -28,14 +28,15 @@ pub fn generate(spec: &ir::Ir, _cfg: &Config) -> GenerationOutput {
     }
     body.push_str(&format!("Operations: {}\n\n", spec.operations.len()));
     for op in &spec.operations {
-        body.push_str(&format!("- `{}` — {} {}\n", op.id, op.method, op.path_template));
+        body.push_str(&format!(
+            "- `{}` — {} {}\n",
+            op.id,
+            op.method.as_str(),
+            op.path_template,
+        ));
     }
     GenerationOutput {
-        files: vec![OutputFile {
-            path: "README.md".into(),
-            contents: body.into_bytes(),
-            mode: FileMode::Text,
-        }],
+        files: vec![OutputFile::text("README.md", body)],
         diagnostics: vec![],
     }
 }
