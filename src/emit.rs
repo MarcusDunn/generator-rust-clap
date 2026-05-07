@@ -468,7 +468,6 @@ fn render_op_match_arm(
 ) -> String {
     let variant = pascal_case(&op.id);
     let method_ident = snake_case(&op.id);
-    let fields = collect_fields(op);
 
     // Bearer resolution per op. Three modes:
     //   - this op references the placeholder ⇒ resolve via RFC 8693
