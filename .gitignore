@@ -1,3 +1,5 @@
 /target
 /Cargo.lock
 /.direnv
+/tests-host/target
+/tests-host/Cargo.lock

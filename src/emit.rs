@@ -1,14 +1,15 @@
 //! Generation entry point. Emits a buildable Rust CLI crate (clap
-//! derive + reqwest) with tag-grouped subcommands and, when the spec
-//! + plugin config opt in, OAuth 2.0 PKCE login/logout plus optional
-//! RFC 8693 token exchange driven by a generic `x-token-exchange`
-//! extension on the chosen oauth2 security scheme.
+//! derive + reqwest) with tag-grouped subcommands. When the spec
+//! plus plugin config opt in, the emitted CLI also supports OAuth
+//! 2.0 PKCE login/logout and optional RFC-8693 token exchange driven
+//! by a generic `x-token-exchange` extension on the chosen `oauth2`
+//! security scheme.
 
 use std::collections::BTreeSet;
 
 use forge_plugin_sdk::ir::{
     Body, HttpMethod, Ir, OAuth2Flow, OAuth2FlowKind, Operation, Parameter, SecurityScheme,
-    SecuritySchemeKind, ValueRef,
+    SecuritySchemeKind,
 };
 use forge_plugin_sdk::{values_ext, GenerationOutput, OutputFile};
 
@@ -364,8 +365,7 @@ fn emit_main_rs(ir: &Ir, cfg: &Config, bin_name: &str, oauth: Option<&OauthInfo>
     if oauth_active {
         out.push_str("        Cmd::Login | Cmd::Logout | Cmd::Configure { .. } | Cmd::Profile(_) => unreachable!(\"handled above\"),\n");
     }
-    if placeholder_pascal.is_some() {
-        let pascal = placeholder_pascal.as_ref().unwrap();
+    if let Some(pascal) = &placeholder_pascal {
         out.push_str(&format!(
             "        Cmd::Set{pascal} {{ .. }} | Cmd::Unset{pascal} | Cmd::Show{pascal} => unreachable!(\"handled above\"),\n"
         ));

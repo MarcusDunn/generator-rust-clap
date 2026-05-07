@@ -1,0 +1,64 @@
+name: ci
+
+# Runs on every push to main and on every PR. Builds the plugin
+# (wasm32-wasip2) and runs the host-side integration tests in
+# `tests-host/`, which load the freshly-built `.wasm` through
+# `forge-test-harness` and assert on emitted code.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: fmt + clippy + tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-wasip2
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Two cargo target dirs share the same toolchain but
+          # different invocations; key on the workflow so they
+          # don't fight each other.
+          key: rust-clap-ci
+          workspaces: |
+            . -> target
+            tests-host -> target
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy (plugin, wasm32-wasip2)
+        # The plugin crate only compiles for wasm32-wasip2 (SDK ADR-0004).
+        # `--all-targets` pulls in test-binary dev-deps that don't
+        # build for wasip2, so check just the lib. Treat warnings as
+        # errors so we don't drift.
+        run: cargo clippy --target wasm32-wasip2 --lib -- -D warnings
+
+      - name: cargo build --release (plugin)
+        # Pre-build so cargo is warm before the harness shells out.
+        run: cargo build --release --target wasm32-wasip2
+
+      - name: cargo test (host-side integration)
+        # forge-test-harness will rebuild the plugin under its own
+        # invariants; the warm cache from the previous step keeps this
+        # cheap. Tests assert on the generated code (file set, schema
+        # constants, schema-flag relaxation, recursion, long_about).
+        run: cargo test --manifest-path tests-host/Cargo.toml --no-fail-fast
