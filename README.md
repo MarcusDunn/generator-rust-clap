@@ -2,11 +2,13 @@
 
 OpenAPI Forge generator that emits a Rust CLI crate (clap derive + reqwest) for an OpenAPI spec.
 
-**Status: bootstrap.** Today the plugin emits a single `README.md` summarizing
-the spec — just enough to validate the OCI publish pipeline end-to-end. Real
-emission (a buildable Rust CLI crate with one clap subcommand per operation,
-auth via `#[arg(env)]`, `clap_complete` for shell completions) lands in
-follow-ups.
+**Status: shipping.** The plugin emits a buildable Rust CLI crate with:
+
+- One clap subcommand per OpenAPI operation, grouped by tag (OAS 3.2 `parent`-aware nesting).
+- OAuth 2.0 PKCE login/logout when the spec declares an `oauth2.authorizationCode` flow + plugin config supplies `clientId`. Optional `client_secret_basic` on the token endpoint via `oauth.clientSecretEnv` (env-var-supplied).
+- RFC 8693 standard token exchange driven by a generic `x-token-exchange` extension on the spec's `oauth2` security scheme — operations whose path includes the placeholder use a separately-audienced JWT.
+- Shell completions for bash / zsh / fish / powershell / elvish via `clap_complete`: `<bin> completion <shell>`.
+- Runtime env-var overrides for `<PREFIX>_AUTH_URL` / `<PREFIX>_TOKEN_URL` / `<PREFIX>_BASE_URL` / `<PREFIX>_TOKEN` so a single binary moves between dev / staging / prod.
 
 This is an *external* plugin — it depends on the published
 [`forge-plugin-sdk`](https://crates.io/crates/forge-plugin-sdk) crate, not on
